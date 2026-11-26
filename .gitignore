@@ -24,3 +24,4 @@ Thumbs.db
 # quality eval: downloaded datasets and per-run outputs
 eval/data/
 eval/out/
+__pycache__/
