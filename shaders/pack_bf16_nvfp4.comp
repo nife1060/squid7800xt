@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+#include "nvfp4_scale_search.glsl"
 
 // Two-mode BF16 -> NVFP4 packer:
 // mode == 0: compute global tensor amax into dst_amax_u32 (atomicMax of floatBitsToUint(abs(v)))
@@ -60,7 +61,7 @@ void main() {
         vals[i] = bf16_to_f32(src_blk.data[i]);
         bmax = max(bmax, abs(vals[i]));
     }
-    uint s_code = encode_e4m3(min(bmax / (6.0 * global_scale), 448.0));
+    uint s_code = nvfp4_search_block_scale(vals, bmax, global_scale);
     U8Buf dst_s = U8Buf(pc.dst_s_addr + uint64_t(bidx));
     dst_s.data[0] = uint8_t(s_code);
 

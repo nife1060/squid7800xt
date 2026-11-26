@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+#include "nvfp4_scale_search.glsl"
 
 // Two-mode MXFP8 -> NVFP4 expert bank converter (layers 20..23):
 // mode == 0: 1 workgroup per expert -> computes exp_global_scale[e] = max(|w|) / (448 * 6)
@@ -70,7 +71,7 @@ void main() {
         vals[i] = decode_e4m3(uint(sw.data[i])) * mx_scale;
         bmax = max(bmax, abs(vals[i]));
     }
-    uint s_code = encode_e4m3(min(bmax / (6.0 * gscale), 448.0));
+    uint s_code = nvfp4_search_block_scale(vals, bmax, gscale);
     bool lo_tier = e < pc.n_lo;
     U8Buf ds = U8Buf((lo_tier ? pc.dst_s_addr : pc.dst_s_hi_addr) + uint64_t(bidx));
     ds.data[0] = uint8_t(s_code);

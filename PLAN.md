@@ -92,3 +92,9 @@ Baseline: `unsloth/Inkling-2-Mini-GGUF:UD-IQ4_XS` (15.73 GiB) -> **24–25 tok/s
   - Baseline (NVFP4 router): ppl `7.172` vs GGUF `7.067` on WikiText-2 (**+1.49%**, CI excludes 0), `2.338` vs `2.343` on code (tied). Top-1 agreement 93.1% / 96.4%.
   - Router kept in BF16 (`linear_bf16.comp`, used in decode and the B=64 prefill; +10 MiB VRAM): WikiText-2 gap **+1.49% → +1.25%** (paired Δ −0.0023 nats/token, window-bootstrap CI [−0.0049, +0.0004]: borderline), code unchanged. Decode `mtp=0` 82.7 → 82.1 tok/s (−0.7%), MTP within noise.
   - **Verdict:** KEEP (cheap, slightly better). Most of the remaining gap is elsewhere (attention / LM head / scale choice).
+
+- **Exp 13 — NVFP4 block-scale search in the load-time packers (`nvfp4_scale_search.glsl`):**
+  - Each 16-block's E4M3 scale is chosen by minimum squared reconstruction error over divisors `{6, 5.5, 5, 4.5, 4}` × the neighbouring E4M3 codes (instead of always `max/6`). Applies to everything we convert (attention, controllers, LM head from BF16; L20–23 experts from MXFP8); the shipped NVFP4 experts (L0–19) are untouched. Same format and bytes: zero runtime cost.
+  - Perplexity: flat (WikiText-2 `7.1557 → 7.1557`, code `2.340 → 2.345`, both well inside noise).
+  - Distance to the independently quantized `UD-IQ4_XS`: KL **0.0215 → 0.0170** (wiki, window-bootstrap CI of the change [−0.0058, −0.0033]) and **0.0135 → 0.0108** (code, [−0.0050, −0.0007]); top-1 agreement 93.2% → 93.7%. Two independent quantizations share only the original model, so moving closer to the GGUF indicates less quantization noise in ours, even though perplexity is too coarse to show it at this sample size.
+  - **Verdict:** KEEP (free, measurably higher fidelity).
