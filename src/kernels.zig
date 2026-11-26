@@ -10,6 +10,7 @@ const spv_embed_norm align(4) = @embedFile("spv_embed_norm");
 const spv_depth_norm align(4) = @embedFile("spv_depth_norm");
 const spv_controller_nvfp4 align(4) = @embedFile("spv_controller_nvfp4");
 const spv_linear_nvfp4 align(4) = @embedFile("spv_linear_nvfp4");
+const spv_linear_bf16 align(4) = @embedFile("spv_linear_bf16");
 const spv_kv_sconv align(4) = @embedFile("spv_kv_sconv");
 const spv_attn_prep_store align(4) = @embedFile("spv_attn_prep_store");
 const spv_attn_tile align(4) = @embedFile("spv_attn_tile");
@@ -116,6 +117,15 @@ pub const PostDepthNormPC = extern struct {
     B: u32,
     commit_block: u32,
     block_idx: u32,
+};
+
+pub const LinearBf16PC = extern struct {
+    w_addr: u64,
+    x_h_addr: u64,
+    y_addr: u64,
+    rows: u32,
+    cols: u32,
+    B: u32,
 };
 
 pub const LinearPC = extern struct {
@@ -405,6 +415,7 @@ pub const Pipelines = struct {
     depth_norm: PipePair = .{},
     controller: PipePair = .{},
     linear: SpecPipeSet = .{},
+    linear_bf16: PipePair = .{},
     kv_sconv: PipePair = .{},
     attn_prep: PipePair = .{},
     attn_tile: SpecPipeSet = .{},
@@ -432,6 +443,7 @@ pub const Pipelines = struct {
             .depth_norm = PipePair.create(ctx, @sizeOf(DepthNormPC), spv_depth_norm, 64),
             .controller = PipePair.create(ctx, @sizeOf(ControllerPC), spv_controller_nvfp4, 64),
             .linear = SpecPipeSet.create(ctx, @sizeOf(LinearPC), spv_linear_nvfp4, 64, &linear_bs),
+            .linear_bf16 = PipePair.create(ctx, @sizeOf(LinearBf16PC), spv_linear_bf16, 64),
             .kv_sconv = PipePair.create(ctx, @sizeOf(KvSconvPC), spv_kv_sconv, 64),
             .attn_prep = PipePair.create(ctx, @sizeOf(AttnPrepPC), spv_attn_prep_store, 64),
             .attn_tile = SpecPipeSet.create(ctx, @sizeOf(AttnTilePC), spv_attn_tile, 64, &attn_bs),
@@ -456,6 +468,7 @@ pub const Pipelines = struct {
         self.depth_norm.destroy(self.ctx);
         self.controller.destroy(self.ctx);
         self.linear.destroy(self.ctx);
+        self.linear_bf16.destroy(self.ctx);
         self.kv_sconv.destroy(self.ctx);
         self.attn_prep.destroy(self.ctx);
         self.attn_tile.destroy(self.ctx);
@@ -492,6 +505,20 @@ pub const Pipelines = struct {
         self.ctx.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pair.pipe);
         self.ctx.vkCmdPushConstants(cmd, pair.layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(@TypeOf(pc)), &pc);
         self.ctx.vkCmdDispatch(cmd, gx, gy, gz);
+    }
+
+    /// Exact BF16 GEMV (shaders/linear_bf16.comp): y[B, rows] = x[B, cols] (F16) . W^T (BF16), F32 out.
+    pub fn cmd_linear_bf16(self: *const Pipelines, cmd: vk.VkCommandBuffer, lw: *const weights_mod.LinearWeight, x_h: u64, y: u64, B: u32) void {
+        tiger.assert(lw.kind == .bf16 and lw.cols <= 4096 and B >= 1 and B <= 64);
+        const pc: LinearBf16PC = .{
+            .w_addr = lw.data,
+            .x_h_addr = x_h,
+            .y_addr = y,
+            .rows = lw.rows,
+            .cols = lw.cols,
+            .B = B,
+        };
+        self.dispatch(cmd, self.linear_bf16, pc, lw.rows, 1, 1);
     }
 
     pub fn cmd_linear(self: *const Pipelines, cmd: vk.VkCommandBuffer, lw: *const weights_mod.LinearWeight, x_h: u64, y: u64, B: u32, add_res: bool) void {

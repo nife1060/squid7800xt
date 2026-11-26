@@ -7,6 +7,7 @@ const vk = @import("vulkan.zig");
 const weights_mod = @import("weights.zig");
 const bench_ceilings = @import("bench_ceilings.zig");
 const server_mod = @import("server.zig");
+const score_mod = @import("score.zig");
 
 extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]const u16;
 
@@ -155,7 +156,8 @@ pub fn main() void {
         return;
     }
 
-    if (std.mem.eql(u8, subcmd, "generate") or std.mem.eql(u8, subcmd, "bench") or std.mem.eql(u8, subcmd, "profile") or std.mem.eql(u8, subcmd, "serve") or std.mem.eql(u8, subcmd, "longctx") or std.mem.eql(u8, subcmd, "attncheck")) {
+    if (std.mem.eql(u8, subcmd, "generate") or std.mem.eql(u8, subcmd, "bench") or std.mem.eql(u8, subcmd, "profile") or std.mem.eql(u8, subcmd, "serve") or std.mem.eql(u8, subcmd, "longctx") or std.mem.eql(u8, subcmd, "attncheck") or std.mem.eql(u8, subcmd, "score")) {
+        const is_score = std.mem.eql(u8, subcmd, "score");
         const model_dir = args.get(2) orelse "models/inkling-2-mini";
         var prompt_text: []const u8 = "Write a Python LRU cache with tests.";
         var max_tokens: u32 = 256;
@@ -174,6 +176,10 @@ pub fn main() void {
         var model_name: []const u8 = "inkling-2-mini";
         var no_prefix_cache: bool = false;
         var expert_tier: ?u32 = null; // null = auto (size from VRAM budget and --ctx)
+        var score_tokens_path: []const u8 = "";
+        var score_out_path: []const u8 = "";
+        var score_window: u32 = 1024;
+        var score_top_k: u32 = 20;
 
         var ai: usize = 3;
         while (ai < args.count) : (ai += 1) {
@@ -220,6 +226,18 @@ pub fn main() void {
             } else if (std.mem.eql(u8, flag, "--expert-tier") and ai + 1 < args.count) {
                 ai += 1;
                 expert_tier = if (std.mem.eql(u8, args.slices[ai], "auto")) null else (std.fmt.parseInt(u32, args.slices[ai], 10) catch null);
+            } else if (std.mem.eql(u8, flag, "--tokens") and ai + 1 < args.count) {
+                ai += 1;
+                score_tokens_path = args.slices[ai];
+            } else if (std.mem.eql(u8, flag, "--out") and ai + 1 < args.count) {
+                ai += 1;
+                score_out_path = args.slices[ai];
+            } else if (std.mem.eql(u8, flag, "--window") and ai + 1 < args.count) {
+                ai += 1;
+                score_window = std.fmt.parseInt(u32, args.slices[ai], 10) catch 1024;
+            } else if (std.mem.eql(u8, flag, "--topk") and ai + 1 < args.count) {
+                ai += 1;
+                score_top_k = std.fmt.parseInt(u32, args.slices[ai], 10) catch 20;
             } else if (std.mem.eql(u8, flag, "--no-prefix-cache")) {
                 no_prefix_cache = true;
             } else if (std.mem.eql(u8, flag, "--debug-mtp")) {
@@ -228,6 +246,15 @@ pub fn main() void {
                 ai += 1;
                 effort = args.slices[ai];
             }
+        }
+
+        if (is_score) {
+            if (score_tokens_path.len == 0 or score_out_path.len == 0) {
+                tiger.print_stderr("Usage: squid7800xt score <model_dir> --tokens in.i32 --out out.bin [--window 1024 --topk 20 --ctx N]\n", .{});
+                std.process.exit(2);
+            }
+            mtp = 0; // scoring never uses the DSpark head; skip loading it
+            ctx_len = @max(ctx_len, score_window + 64);
         }
 
         var tok: tokenizer_mod.Tokenizer = .{};
@@ -271,6 +298,15 @@ pub fn main() void {
         }
         if (std.mem.eql(u8, subcmd, "attncheck")) {
             eng.check_attention();
+            return;
+        }
+        if (is_score) {
+            score_mod.run(&eng, &tok, .{
+                .tokens_path = score_tokens_path,
+                .out_path = score_out_path,
+                .window = score_window,
+                .top_k = score_top_k,
+            });
             return;
         }
 
@@ -350,5 +386,5 @@ pub fn main() void {
         return;
     }
 
-    tiger.print_stderr("Usage: squid7800xt <ceilings|load|generate|bench|profile|longctx|attncheck|serve> [model_dir] [--prompt ... --max-tokens N --ctx N --mtp N --host H --port P --expert-tier auto|N]\n", .{});
+    tiger.print_stderr("Usage: squid7800xt <ceilings|load|generate|bench|profile|longctx|attncheck|score|serve> [model_dir] [--prompt ... --max-tokens N --ctx N --mtp N --host H --port P --expert-tier auto|N]\n", .{});
 }

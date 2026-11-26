@@ -1,0 +1,57 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Exact BF16-weight GEMV for small, accuracy-critical matrices (the MoE router):
+//   y[b, row] = W[row, :] . x[b, :]     W: [rows, cols] BF16, x: [B, cols] F16, y: [B, rows] F32
+// One workgroup (4 x Wave64) per output row. The row's weights stay in registers (cols <= 4096)
+// and are reused for every batch row; accumulation is F32. Serves decode (B <= 8) and the
+// B = 64 WMMA prefill. The router is 128 x 2304, so this is ~0.6 MB per call: bandwidth-trivial.
+// Grid: (rows, 1, 1), Local: 256.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t x_h_addr;
+    uint64_t y_addr;
+    uint rows;
+    uint cols;
+    uint B;     // 1..64
+} pc;
+
+const uint PER_THREAD_MAX = 16u; // 16 * 256 = 4096 columns
+const uint B_MAX = 64u;
+
+shared float s_part[4][B_MAX]; // [subgroup][b]
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    U16Buf w = U16Buf(pc.w_addr + uint64_t(row) * uint64_t(pc.cols) * 2ul);
+    float wr[PER_THREAD_MAX];
+    for (uint i = 0u; i < PER_THREAD_MAX; ++i) {
+        uint k = tid + i * 256u;
+        wr[i] = (k < pc.cols) ? bf16_to_f32(w.data[k]) : 0.0;
+    }
+
+    F16Buf x = F16Buf(pc.x_h_addr);
+    for (uint b = 0u; b < pc.B; ++b) {
+        uint xo = b * pc.cols;
+        float acc = 0.0;
+        for (uint i = 0u; i < PER_THREAD_MAX; ++i) {
+            uint k = tid + i * 256u;
+            if (k < pc.cols) acc = fma(wr[i], float(x.data[xo + k]), acc);
+        }
+        acc = subgroupAdd(acc);
+        if (subgroupElect()) s_part[gl_SubgroupID][b] = acc;
+    }
+    barrier();
+
+    if (tid < pc.B) {
+        float s = 0.0;
+        for (uint sg = 0u; sg < gl_NumSubgroups; ++sg) s += s_part[sg][tid];
+        F32Buf(pc.y_addr).data[tid * pc.rows + row] = s;
+    }
+}

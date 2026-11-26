@@ -86,3 +86,9 @@ Baseline: `unsloth/Inkling-2-Mini-GGUF:UD-IQ4_XS` (15.73 GiB) -> **24–25 tok/s
   | 130,000 | 63.18 ms (15.8) | 22.39 ms (44.7) | 15.1 | 47.9–51.9 |
 
   With `ctx=65536` (tier 4): `14.01 / 14.75 / 15.87 / 16.31 / 18.30 ms` at `0 / 4K / 16K / 32K / 65K` (vs `11.63 / 23.37 / 26.48 / 30.98 / 41.54 ms` before). The `pos=0` cost of the tier is the price of keeping the full window's KV in VRAM; `--expert-tier 0` restores it when long contexts are not needed.
+
+- **Exp 12 — Output-quality eval vs. `UD-IQ4_XS` + BF16 router:**
+  - New `score` subcommand (teacher-forced B=8 forward + full-vocab LM head into host memory) and `eval/quality.py`, which scores the same token ids with llama-server (forced-token `logit_bias`, raw full-vocab probabilities). 24×512 WikiText-2 windows + 12×512 HumanEval windows, first 32 positions of each skipped.
+  - Baseline (NVFP4 router): ppl `7.172` vs GGUF `7.067` on WikiText-2 (**+1.49%**, CI excludes 0), `2.338` vs `2.343` on code (tied). Top-1 agreement 93.1% / 96.4%.
+  - Router kept in BF16 (`linear_bf16.comp`, used in decode and the B=64 prefill; +10 MiB VRAM): WikiText-2 gap **+1.49% → +1.25%** (paired Δ −0.0023 nats/token, window-bootstrap CI [−0.0049, +0.0004]: borderline), code unchanged. Decode `mtp=0` 82.7 → 82.1 tok/s (−0.7%), MTP within noise.
+  - **Verdict:** KEEP (cheap, slightly better). Most of the remaining gap is elsewhere (attention / LM head / scale choice).

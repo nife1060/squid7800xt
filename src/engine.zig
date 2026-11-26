@@ -180,6 +180,10 @@ pub const Engine = struct {
     cmd_b8_prefill_mtp: vk.VkCommandBuffer = null,
     cmd_b8_prefill_lm_mtp: vk.VkCommandBuffer = null,
     cmd_b64_prefill_mtp: vk.VkCommandBuffer = null,
+    // Teacher-forced scoring (`score` subcommand): B=8 forward + full-vocab LM head into host memory.
+    // Built lazily by score_tokens(); never touched by generate/serve.
+    cmd_b8_score: vk.VkCommandBuffer = null,
+    score_logits_buf: vk.GpuBuffer = .{},
     cmd_dspark_draft: [constants.mtp_draft_count_max + 1]vk.VkCommandBuffer = @splat(null),
     cmd_verify: [constants.mtp_block_size_max + 1]vk.VkCommandBuffer = @splat(null),
 
@@ -619,7 +623,11 @@ pub const Engine = struct {
             self.cmd_b8_prefill_mtp,
             self.cmd_b8_prefill_lm_mtp,
             self.cmd_b64_prefill_mtp,
+            self.cmd_b8_score,
         };
+        if (self.score_logits_buf.buffer != vk.VK_NULL_HANDLE) {
+            self.ctx.destroy_buffer(&self.score_logits_buf);
+        }
         for (singles) |c| {
             if (c != null) self.ctx.vkFreeCommandBuffers(self.ctx.device, self.ctx.cmd_pool, 1, &.{c});
         }
@@ -1150,8 +1158,8 @@ pub const Engine = struct {
                 self.ctx.cmd_compute_barrier(cmd);
             }
 
-            // RDNA 3 WMMA router + Single-Pass B=64 MoE (reads each expert ONCE across all 64 tokens!)
-            p.cmd_linear_wmma(cmd, &lw.router_nvfp4, self.p_mlp_normed_h, self.p_router_logits, false);
+            // Exact BF16 router + Single-Pass B=64 MoE (reads each expert ONCE across all 64 tokens!)
+            p.cmd_linear_bf16(cmd, &lw.router, self.p_mlp_normed_h, self.p_router_logits, B64);
             self.ctx.cmd_compute_barrier(cmd);
 
             p.dispatch(cmd, p.moe_prefill_b64, kernels.MoePrefillB64PC{
@@ -1804,7 +1812,7 @@ pub const Engine = struct {
                 prof_mark(prof, cmd, .controller);
             }
 
-            p.cmd_linear(cmd, &lw.router_nvfp4, self.mlp_normed_h, self.router_logits, B, false);
+            p.cmd_linear_bf16(cmd, &lw.router, self.mlp_normed_h, self.router_logits, B);
             self.ctx.cmd_compute_barrier(cmd);
 
             p.dispatch(cmd, p.route_topk, kernels.RouteTopkPC{
@@ -2004,6 +2012,50 @@ pub const Engine = struct {
             self.ctx.submit_and_wait(cmd);
             off += chunk;
         }
+    }
+
+    pub const ScoreRowFn = *const fn (cb_ctx: ?*anyopaque, pos: usize, logits: []const f32) void;
+
+    /// Teacher-forced scoring for quality evaluation. Feeds `tokens` from position 0 through the
+    /// B=8 forward path (the same GEMV numerics as decode / MTP verify, no MTP, no prefix cache)
+    /// and calls `on_row(cb_ctx, i, logits)` for every i in [0, n8), where n8 = len rounded down
+    /// to a multiple of 8. `logits` are the raw LM-head outputs over the unpadded vocab that
+    /// predict tokens[i + 1]; the caller applies the final softcap.
+    pub fn score_tokens(self: *Engine, tokens: []const i32, on_row: ScoreRowFn, cb_ctx: ?*anyopaque) void {
+        const V: u64 = constants.vocab_unpadded_count;
+        if (self.cmd_b8_score == null) {
+            self.score_logits_buf = self.ctx.create_host_buffer(8 * V * 4, true, true);
+            const cmd = self.ctx.alloc_command_buffer();
+            const bi: vk.VkCommandBufferBeginInfo = .{ .flags = vk.VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT };
+            tiger.assert_vk(self.ctx.vkBeginCommandBuffer(cmd, &bi));
+            self.record_target_forward(cmd, 8, false, false, false, false, null);
+            self.ctx.cmd_compute_barrier(cmd);
+            self.pipes.cmd_linear(cmd, &self.weights.unembed, self.mlp_normed_h, self.score_logits_buf.address, 8, false);
+            tiger.assert_vk(self.ctx.vkEndCommandBuffer(cmd));
+            self.cmd_b8_score = cmd;
+        }
+        tiger.assert(self.weights.unembed.rows == V);
+        tiger.assert(tokens.len < self.context_tokens_max);
+
+        self.reset();
+        for (&self.prefix_cache.checkpoints) |*ckpt| ckpt.valid = false;
+        self.prefix_cache.session_len = 0;
+        self.prefix_cache.gpu_live_at_pos = 0;
+        self.ctrl.sample_inv_temp = 0.0;
+
+        const logits_all: [*]const f32 = @ptrCast(@alignCast(self.score_logits_buf.mapped.?));
+        const n8 = tokens.len - tokens.len % 8;
+        var pos: usize = 0;
+        while (pos < n8) : (pos += 8) {
+            self.ctrl.pos = @intCast(pos);
+            for (0..8) |j| self.ctrl.tokens[j] = tokens[pos + j];
+            self.ctx.submit_and_wait(self.cmd_b8_score);
+            for (0..8) |j| {
+                const row = logits_all[j * V ..][0..V];
+                on_row(cb_ctx, pos + j, row);
+            }
+        }
+        self.current_position = @intCast(n8);
     }
 
     fn prefill_range(self: *Engine, prompt: []const i32, start: usize, end: usize, use_mtp: bool, compute_final_lm: bool) void {

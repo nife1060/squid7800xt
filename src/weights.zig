@@ -72,7 +72,7 @@ pub const LayerWeights = struct {
 
     ctrl: [4]ControllerWeights = @splat(.{}),
 
-    router_nvfp4: LinearWeight = .{},
+    router: LinearWeight = .{}, // BF16 [expert_count, hidden_dim]: kept exact, routing flips are discrete errors
     router_bias: u64 = 0,
     w13: ExpertBank = .{},
     w2: ExpertBank = .{},
@@ -405,10 +405,14 @@ pub const ModelWeights = struct {
                 }
             }
 
-            // Router -> NVFP4 + F32 bias
+            // Router -> BF16 (exact, ~0.6 MB/layer) + F32 bias
             {
-                _ = copy_layer_tensor(&sf_main, layer_idx, "mlp.gate.weight", pk.stage.mapped.?, @as(usize, constants.expert_count) * constants.hidden_dim * 2);
-                lw.router_nvfp4 = self.pack_bf16_to_nvfp4(&pk, pk.stage.address, constants.expert_count, constants.hidden_dim);
+                lw.router = .{
+                    .kind = .bf16,
+                    .rows = constants.expert_count,
+                    .cols = constants.hidden_dim,
+                    .data = self.upload_layer_tensor(&sf_main, layer_idx, "mlp.gate.weight", @as(u64, constants.expert_count) * constants.hidden_dim * 2, &pk.stage),
+                };
                 const rb_name = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.mlp.gate.bias", .{layer_idx}) catch unreachable;
                 lw.router_bias = self.upload_tensor(&sf_main, rb_name, constants.expert_count * 4, &pk.stage);
             }

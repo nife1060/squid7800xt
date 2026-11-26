@@ -20,3 +20,7 @@ refs/
 Thumbs.db
 *.tmp
 *.log
+
+# quality eval: downloaded datasets and per-run outputs
+eval/data/
+eval/out/

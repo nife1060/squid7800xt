@@ -17,6 +17,7 @@ const shaders = [_]ShaderSpec{
     .{ .name = "spv_depth_norm", .src = "shaders/depth_norm.comp", .out = "depth_norm.spv" },
     .{ .name = "spv_controller_nvfp4", .src = "shaders/controller_nvfp4.comp", .out = "controller_nvfp4.spv" },
     .{ .name = "spv_linear_nvfp4", .src = "shaders/linear_nvfp4.comp", .out = "linear_nvfp4.spv" },
+    .{ .name = "spv_linear_bf16", .src = "shaders/linear_bf16.comp", .out = "linear_bf16.spv" },
     .{ .name = "spv_kv_sconv", .src = "shaders/kv_sconv.comp", .out = "kv_sconv.spv" },
     .{ .name = "spv_attn_prep_store", .src = "shaders/attn_prep_store.comp", .out = "attn_prep_store.spv" },
     .{ .name = "spv_attn_tile", .src = "shaders/attn_tile.comp", .out = "attn_tile.spv" },
