@@ -1,0 +1,67 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Stage 2: Merge attn_tile split partials + attention sink + sigmoid output gate.
+// Grid: (NUM_HEADS, rows, 1), Local: 128 (thread = head dim).
+// Recomputes the exact split layout attn_tile used for this row's group.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t qrgs_addr;        // [rows, QRGS_DIM] F32 (gate + sink logits)
+    uint64_t split_buf_addr;
+    uint64_t out_gated_addr;   // optional [rows, 3072] F32
+    uint64_t out_gated_h_addr; // [rows, 3072] F16
+    uint64_t d_pos_addr;
+    uint span;
+    int last_off;
+    uint row_step;
+    uint group_rows;  // SPEC_B used by attn_tile
+    uint rows_total;
+    uint n_split_max;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint row = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    int pos0 = I32Buf(pc.d_pos_addr).data[0];
+    uint row0 = (row / pc.group_rows) * pc.group_rows;
+    int last0 = pos0 + pc.last_off + int(row0 * pc.row_step);
+    int lastN = last0 + int((pc.group_rows - 1u) * pc.row_step);
+    int lo = max(0, last0 + 1 - int(pc.span));
+    uvec2 lay = attn_split_layout(lo, lastN + 1, pc.n_split_max);
+
+    uint64_t qbase = pc.qrgs_addr + uint64_t(row * QRGS_DIM) * 4ul;
+    F32Buf gate_p = F32Buf(qbase + uint64_t(Q_DIM + R_DIM + h * HEAD_DIM) * 4ul);
+    F32Buf sink_p = F32Buf(qbase + uint64_t(Q_DIM + R_DIM + Q_DIM + h) * 4ul);
+    float sink = sink_p.data[0];
+
+    uint E = NUM_HEADS * pc.rows_total * pc.n_split_max;
+    uint base = (h * pc.rows_total + row) * pc.n_split_max;
+    F32Buf s_m = F32Buf(pc.split_buf_addr);
+    F32Buf s_d = F32Buf(pc.split_buf_addr + uint64_t(E) * 4ul);
+    F32Buf s_o = F32Buf(pc.split_buf_addr + uint64_t(2u * E) * 4ul);
+
+    float g_m = sink;
+    for (uint s = 0u; s < lay.y; ++s) {
+        if (s_d.data[base + s] > 0.0) g_m = max(g_m, s_m.data[base + s]);
+    }
+    float g_d = exp(sink - g_m);
+    float g_o = 0.0;
+    for (uint s = 0u; s < lay.y; ++s) {
+        float sd = s_d.data[base + s];
+        if (sd > 0.0) {
+            float sc = exp(s_m.data[base + s] - g_m);
+            g_d += sd * sc;
+            g_o += s_o.data[(base + s) * HEAD_DIM + tid] * sc;
+        }
+    }
+
+    float val = (g_o / g_d) * fast_sigmoid(gate_p.data[tid]);
+    uint oidx = row * Q_DIM + h * HEAD_DIM + tid;
+    if (pc.out_gated_addr != 0ul) F32Buf(pc.out_gated_addr).data[oidx] = val;
+    if (pc.out_gated_h_addr != 0ul) F16Buf(pc.out_gated_h_addr).data[oidx] = float16_t(val);
+}

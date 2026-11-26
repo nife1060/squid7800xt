@@ -1,0 +1,97 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Embed lookup (from zero-copy host-pinned DDR5 BF16 table) + RMSNorm(embed_norm).
+// Grid: (B, 1, 1), Local: 256 threads (Wave64 -> 4 subgroups).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t embed_addr;
+    uint64_t norm_addr;
+    uint64_t tokens_addr;
+    uint64_t out_addr;
+    uint B;
+    uint mode; // 0 = embed_norm, 1 = plain rmsnorm (norm_addr may be 0), 2 = extract/copy block
+    uint src_stride_elems;
+    uint slot_idx;
+} pc;
+
+shared float s_red[8];
+shared float s_inv_rms;
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (b >= pc.B) return;
+
+    if (pc.mode == 2u) {
+        // Copy [B, HIDDEN]: src[b * src_stride_elems + slot_idx * HIDDEN] -> dst[b * HIDDEN]
+        F32Buf src = F32Buf(pc.embed_addr + uint64_t(b * pc.src_stride_elems + pc.slot_idx * HIDDEN) * 4ul);
+        F32Buf dst = F32Buf(pc.out_addr + uint64_t(b * HIDDEN) * 4ul);
+        for (uint d = tid; d < HIDDEN; d += 256u) {
+            dst.data[d] = src.data[d];
+        }
+        return;
+    }
+
+    if (pc.mode == 1u) {
+        // Generic RMSNorm on [B, HIDDEN] F32
+        F32Buf x = F32Buf(pc.embed_addr + uint64_t(b * HIDDEN) * 4ul);
+        F32Buf o = F32Buf(pc.out_addr + uint64_t(b * HIDDEN) * 4ul);
+        float sum_sq = 0.0;
+        for (uint d = tid; d < HIDDEN; d += 256u) {
+            float v = x.data[d];
+            sum_sq = fma(v, v, sum_sq);
+        }
+        float sg = subgroupAdd(sum_sq);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sg;
+        barrier();
+        if (tid == 0u) {
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) tot += s_red[s];
+            s_inv_rms = inversesqrt(tot / float(HIDDEN) + RMS_EPS);
+        }
+        barrier();
+        float ir = s_inv_rms;
+        if (pc.norm_addr != 0ul) {
+            U16Buf nw = U16Buf(pc.norm_addr);
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                o.data[d] = x.data[d] * ir * bf16_to_f32(nw.data[d]);
+            }
+        } else {
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                o.data[d] = x.data[d] * ir;
+            }
+        }
+        return;
+    }
+
+    // mode == 0: embed lookup + RMSNorm(embed_norm) with BF16 parity
+    I32Buf toks = I32Buf(pc.tokens_addr);
+    int tok = toks.data[b];
+    U16Buf row = U16Buf(pc.embed_addr + uint64_t(uint(tok)) * uint64_t(HIDDEN) * 2ul);
+    U16Buf nw = U16Buf(pc.norm_addr);
+    F32Buf o = F32Buf(pc.out_addr + uint64_t(b * HIDDEN) * 4ul);
+
+    float sum_sq = 0.0;
+    for (uint d = tid; d < HIDDEN; d += 256u) {
+        float v = bf16_to_f32(row.data[d]);
+        sum_sq = fma(v, v, sum_sq);
+    }
+    float sg = subgroupAdd(sum_sq);
+    if (subgroupElect()) s_red[gl_SubgroupID] = sg;
+    barrier();
+    if (tid == 0u) {
+        float tot = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) tot += s_red[s];
+        s_inv_rms = inversesqrt(tot / float(HIDDEN) + RMS_EPS);
+    }
+    barrier();
+    float ir = s_inv_rms;
+    for (uint d = tid; d < HIDDEN; d += 256u) {
+        float v = bf16_to_f32(row.data[d]) * ir;
+        v = round_bf16(v) * bf16_to_f32(nw.data[d]);
+        o.data[d] = round_bf16(v);
+    }
+}

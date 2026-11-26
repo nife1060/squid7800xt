@@ -1,0 +1,160 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Fused: partial = rmsnorm(hidden, null) + depth_attn(blocks, partial, queries[s]) + optional rmsnorm(norm[s]) + F16 copy!
+// Grid: (B, n_out, 1), Local: 256 threads (Wave64 -> 4 subgroups).
+// Handles n_out = 1 (local / MLP / final output) OR n_out = 3 (global Q/K/V) in ONE dispatch!
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t hidden_addr;
+    uint64_t partial_out_addr; // optional (written by s==0 if != 0)
+    uint64_t blocks_addr;      // [B, 4, HIDDEN]
+    uint64_t queries_addr;     // [n_out, HIDDEN] F32 (0 when l==0 -> skip depth_attn)
+    uint64_t norm0_addr;
+    uint64_t norm1_addr;
+    uint64_t norm2_addr;
+    uint64_t out0_addr;
+    uint64_t out1_addr;
+    uint64_t out2_addr;
+    uint64_t out_h0_addr;
+    uint64_t out_h1_addr;
+    uint64_t out_h2_addr;
+    uint n_blocks;
+    uint B;
+} pc;
+
+shared float s_partial[HIDDEN];
+shared float s_val[HIDDEN];
+shared float s_red[8];
+shared float s_partials[8][8];
+shared float s_weights[8];
+shared float s_inv_rms;
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint s = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (b >= pc.B) return;
+
+    F32Buf hb = F32Buf(pc.hidden_addr + uint64_t(b * HIDDEN) * 4ul);
+    float sum_sq = 0.0;
+    for (uint d = tid; d < HIDDEN; d += 256u) {
+        float v = hb.data[d];
+        s_partial[d] = v;
+        sum_sq = fma(v, v, sum_sq);
+    }
+    float sg = subgroupAdd(sum_sq);
+    if (subgroupElect()) s_red[gl_SubgroupID] = sg;
+    barrier();
+    if (tid == 0u) {
+        float tot = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += s_red[i];
+        s_inv_rms = inversesqrt(tot / float(HIDDEN) + RMS_EPS);
+    }
+    barrier();
+
+    float ir = s_inv_rms;
+    bool write_p = (s == 0u && pc.partial_out_addr != 0ul);
+    F32Buf po = F32Buf(pc.partial_out_addr + uint64_t(b * HIDDEN) * 4ul);
+    for (uint d = tid; d < HIDDEN; d += 256u) {
+        float pv = s_partial[d] * ir;
+        s_partial[d] = pv;
+        if (write_p) po.data[d] = pv;
+    }
+    barrier();
+
+    uint64_t norm_a = (s == 0u) ? pc.norm0_addr : ((s == 1u) ? pc.norm1_addr : pc.norm2_addr);
+    uint64_t out_a  = (s == 0u) ? pc.out0_addr  : ((s == 1u) ? pc.out1_addr  : pc.out2_addr);
+    uint64_t outh_a = (s == 0u) ? pc.out_h0_addr: ((s == 1u) ? pc.out_h1_addr: pc.out_h2_addr);
+
+    F32Buf ob = F32Buf(out_a + uint64_t(b * HIDDEN) * 4ul);
+    F16Buf ohb = F16Buf(outh_a + uint64_t(b * HIDDEN) * 2ul);
+
+    if (pc.queries_addr != 0ul) {
+        F32Buf q = F32Buf(pc.queries_addr + uint64_t(s * HIDDEN) * 4ul);
+        uint n_cand = pc.n_blocks + 1u;
+        for (uint c = 0u; c < n_cand; ++c) {
+            float acc = 0.0;
+            if (c < pc.n_blocks) {
+                F32Buf blk = F32Buf(pc.blocks_addr + uint64_t((b * 4u + c) * HIDDEN) * 4ul);
+                for (uint d = tid; d < HIDDEN; d += 256u) acc = fma(q.data[d], blk.data[d], acc);
+            } else {
+                for (uint d = tid; d < HIDDEN; d += 256u) acc = fma(q.data[d], s_partial[d], acc);
+            }
+            float sga = subgroupAdd(acc);
+            if (subgroupElect()) s_partials[gl_SubgroupID][c] = sga;
+        }
+        barrier();
+        if (tid == 0u) {
+            float logits[8];
+            float mx = -1e30;
+            for (uint c = 0u; c < n_cand; ++c) {
+                float dot = 0.0;
+                for (uint w = 0u; w < gl_NumSubgroups; ++w) dot += s_partials[w][c];
+                logits[c] = dot * INV_SQRT_HIDDEN;
+                mx = max(mx, logits[c]);
+            }
+            float den = 0.0;
+            for (uint c = 0u; c < n_cand; ++c) {
+                s_weights[c] = exp(logits[c] - mx);
+                den += s_weights[c];
+            }
+            float inv_d = 1.0 / den;
+            for (uint c = 0u; c < n_cand; ++c) s_weights[c] *= inv_d;
+        }
+        barrier();
+
+        float n_sq = 0.0;
+        for (uint d = tid; d < HIDDEN; d += 256u) {
+            float v = s_weights[pc.n_blocks] * s_partial[d];
+            for (uint c = 0u; c < pc.n_blocks; ++c) {
+                F32Buf blk = F32Buf(pc.blocks_addr + uint64_t((b * 4u + c) * HIDDEN) * 4ul);
+                v = fma(s_weights[c], blk.data[d], v);
+            }
+            s_val[d] = v;
+            n_sq = fma(v, v, n_sq);
+        }
+        if (norm_a != 0ul) {
+            float sgn = subgroupAdd(n_sq);
+            if (subgroupElect()) s_red[gl_SubgroupID] = sgn;
+            barrier();
+            if (tid == 0u) {
+                float tot = 0.0;
+                for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += s_red[i];
+                s_inv_rms = inversesqrt(tot / float(HIDDEN) + RMS_EPS);
+            }
+            barrier();
+            float s2 = s_inv_rms;
+            U16Buf nw = U16Buf(norm_a);
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                float v = s_val[d] * s2 * bf16_to_f32(nw.data[d]);
+                ob.data[d] = v;
+                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
+            }
+        } else {
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                float v = s_val[d];
+                ob.data[d] = v;
+                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
+            }
+        }
+    } else {
+        if (norm_a != 0ul) {
+            U16Buf nw = U16Buf(norm_a);
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                float v = round_bf16(s_partial[d]) * bf16_to_f32(nw.data[d]);
+                ob.data[d] = v;
+                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
+            }
+        } else {
+            for (uint d = tid; d < HIDDEN; d += 256u) {
+                float v = s_partial[d];
+                ob.data[d] = v;
+                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
+            }
+        }
+    }
+}

@@ -1,0 +1,210 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Batched Multi-Stream NVFP4 Cross-Pass Controller:
+// Launches all 3 Attention streams (Q, K, V) in ONE dispatch (Grid = (B, 3, 1))
+// OR 1 MLP stream (Grid = (B, 1, 1)), reading per-stream weight pointers from ControllerDesc!
+// Local: 256 threads (Wave64 -> 4 subgroups, fits easily inside 32 KiB LDS!).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) buffer CtrlDescBuf {
+    uint64_t cp_q_addr;
+    uint64_t down_w_addr;
+    uint64_t down_s_addr;
+    uint64_t forget_w_addr;
+    uint64_t forget_s_addr;
+    uint64_t gain_w_addr;
+    uint64_t gain_s_addr;
+    uint64_t post_norm_addr;
+    float down_gs;
+    float forget_gs;
+    float gain_gs;
+    uint pad;
+};
+
+layout(push_constant) uniform PC {
+    uint64_t desc_base_addr;   // CtrlDescBuf[n_streams] (each 80 bytes!)
+    uint64_t x0_addr;
+    uint64_t x1_addr;
+    uint64_t x2_addr;
+    uint64_t saved_addr;
+    uint64_t prior_last_addr;
+    uint64_t out0_addr;
+    uint64_t out1_addr;
+    uint64_t out2_addr;
+    uint64_t out_h0_addr;
+    uint64_t out_h1_addr;
+    uint64_t out_h2_addr;
+    uint B;
+} pc;
+
+shared float16_t s_cat[2 * HIDDEN];
+shared float s_msg[HIDDEN];
+shared float s_m[HIDDEN];
+shared float16_t s_d[GATE_RANK];
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+shared float s_r0[8];
+shared float s_r1[8];
+shared float s_r2[8];
+shared float s_w0, s_w1, s_inv_x, s_inv_m;
+
+float nvfp4_blk16_dot_lds(uvec2 w8, uint cat_off) {
+    f16vec2 p0 = s_e2m1x2[w8.x & 0xFFu] * f16vec2(s_cat[cat_off + 0u], s_cat[cat_off + 1u]);
+    f16vec2 p1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu] * f16vec2(s_cat[cat_off + 2u], s_cat[cat_off + 3u]);
+    p0 = fma(s_e2m1x2[(w8.x >> 16u) & 0xFFu], f16vec2(s_cat[cat_off + 4u], s_cat[cat_off + 5u]), p0);
+    p1 = fma(s_e2m1x2[(w8.x >> 24u) & 0xFFu], f16vec2(s_cat[cat_off + 6u], s_cat[cat_off + 7u]), p1);
+    p0 = fma(s_e2m1x2[w8.y & 0xFFu], f16vec2(s_cat[cat_off + 8u], s_cat[cat_off + 9u]), p0);
+    p1 = fma(s_e2m1x2[(w8.y >> 8u) & 0xFFu], f16vec2(s_cat[cat_off + 10u], s_cat[cat_off + 11u]), p1);
+    p0 = fma(s_e2m1x2[(w8.y >> 16u) & 0xFFu], f16vec2(s_cat[cat_off + 12u], s_cat[cat_off + 13u]), p0);
+    p1 = fma(s_e2m1x2[(w8.y >> 24u) & 0xFFu], f16vec2(s_cat[cat_off + 14u], s_cat[cat_off + 15u]), p1);
+    f16vec2 s2 = p0 + p1;
+    return float(s2.x) + float(s2.y);
+}
+
+float nvfp4_blk16_dot_d(uvec2 w8, uint d_off) {
+    f16vec2 p0 = s_e2m1x2[w8.x & 0xFFu] * f16vec2(s_d[d_off + 0u], s_d[d_off + 1u]);
+    f16vec2 p1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu] * f16vec2(s_d[d_off + 2u], s_d[d_off + 3u]);
+    p0 = fma(s_e2m1x2[(w8.x >> 16u) & 0xFFu], f16vec2(s_d[d_off + 4u], s_d[d_off + 5u]), p0);
+    p1 = fma(s_e2m1x2[(w8.x >> 24u) & 0xFFu], f16vec2(s_d[d_off + 6u], s_d[d_off + 7u]), p1);
+    p0 = fma(s_e2m1x2[w8.y & 0xFFu], f16vec2(s_d[d_off + 8u], s_d[d_off + 9u]), p0);
+    p1 = fma(s_e2m1x2[(w8.y >> 8u) & 0xFFu], f16vec2(s_d[d_off + 10u], s_d[d_off + 11u]), p1);
+    p0 = fma(s_e2m1x2[(w8.y >> 16u) & 0xFFu], f16vec2(s_d[d_off + 12u], s_d[d_off + 13u]), p0);
+    p1 = fma(s_e2m1x2[(w8.y >> 24u) & 0xFFu], f16vec2(s_d[d_off + 14u], s_d[d_off + 15u]), p1);
+    f16vec2 s2 = p0 + p1;
+    return float(s2.x) + float(s2.y);
+}
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint s = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (b >= pc.B) return;
+
+    s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
+    s_e4m3[tid] = decode_e4m3(tid);
+
+    CtrlDescBuf desc = CtrlDescBuf(pc.desc_base_addr + uint64_t(s) * 80ul);
+    uint64_t x_a    = (s == 0u) ? pc.x0_addr     : ((s == 1u) ? pc.x1_addr     : pc.x2_addr);
+    uint64_t out_a  = (s == 0u) ? pc.out0_addr   : ((s == 1u) ? pc.out1_addr   : pc.out2_addr);
+    uint64_t outh_a = (s == 0u) ? pc.out_h0_addr : ((s == 1u) ? pc.out_h1_addr : pc.out_h2_addr);
+
+    F32Buf q = F32Buf(desc.cp_q_addr);
+    F32Buf sv = F32Buf(pc.saved_addr + uint64_t(b * HIDDEN) * 4ul);
+    F32Buf pl = F32Buf(pc.prior_last_addr + uint64_t(b * HIDDEN) * 4ul);
+    F32Buf xb = F32Buf(x_a + uint64_t(b * HIDDEN) * 4ul);
+
+    float d0 = 0.0, d1 = 0.0, xsq = 0.0;
+    for (uint d = tid; d < HIDDEN; d += 256u) {
+        float qv = q.data[d];
+        d0 = fma(qv, sv.data[d], d0);
+        d1 = fma(qv, pl.data[d], d1);
+        float xv = xb.data[d];
+        s_m[d] = xv;
+        xsq = fma(xv, xv, xsq);
+    }
+    float sg0 = subgroupAdd(d0), sg1 = subgroupAdd(d1), sgx = subgroupAdd(xsq);
+    if (subgroupElect()) { s_r0[gl_SubgroupID] = sg0; s_r1[gl_SubgroupID] = sg1; s_r2[gl_SubgroupID] = sgx; }
+    barrier();
+    if (tid == 0u) {
+        float t0 = 0.0, t1 = 0.0, tx = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) { t0 += s_r0[i]; t1 += s_r1[i]; tx += s_r2[i]; }
+        float l0 = t0 * INV_SQRT_HIDDEN, l1 = t1 * INV_SQRT_HIDDEN;
+        float mx = max(l0, l1);
+        float e0 = exp(l0 - mx), e1 = exp(l1 - mx);
+        float inv = 1.0 / (e0 + e1);
+        s_w0 = e0 * inv; s_w1 = e1 * inv;
+        s_inv_x = inversesqrt(tx / float(HIDDEN) + RMS_EPS);
+    }
+    barrier();
+
+    float ww0 = s_w0, ww1 = s_w1, ix = s_inv_x, msq = 0.0;
+    for (uint d = tid; d < HIDDEN; d += 256u) {
+        float mv = ww0 * sv.data[d] + ww1 * pl.data[d];
+        s_msg[d] = mv;
+        s_cat[d] = float16_t(s_m[d] * ix);
+        msq = fma(mv, mv, msq);
+    }
+    float sgm = subgroupAdd(msq);
+    if (subgroupElect()) s_r0[gl_SubgroupID] = sgm;
+    barrier();
+    if (tid == 0u) {
+        float tm = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) tm += s_r0[i];
+        s_inv_m = inversesqrt(tm / float(HIDDEN) + RMS_EPS);
+    }
+    barrier();
+    float im = s_inv_m;
+    for (uint d = tid; d < HIDDEN; d += 256u) s_cat[HIDDEN + d] = float16_t(s_msg[d] * im);
+    barrier();
+
+    uint64_t down_w_a = desc.down_w_addr;
+    uint64_t down_s_a = desc.down_s_addr;
+    float down_gs = desc.down_gs;
+    uint r_in_wg = tid >> 4u;
+    uint lane16 = tid & 15u;
+    for (uint pass = 0u; pass < 4u; ++pass) {
+        uint r = pass * 16u + r_in_wg;
+        Uvec2Buf wr = Uvec2Buf(down_w_a + uint64_t(r) * uint64_t(HIDDEN) * 1ul);
+        U8Buf sr = U8Buf(down_s_a + uint64_t(r) * 288ul);
+        float acc = 0.0;
+        for (uint blk = lane16; blk < 288u; blk += 16u) {
+            acc = fma(nvfp4_blk16_dot_lds(wr.data[blk], blk << 4u), s_e4m3[uint(sr.data[blk])], acc);
+        }
+        acc += subgroupShuffleXor(acc, 8u);
+        acc += subgroupShuffleXor(acc, 4u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 1u);
+        if (lane16 == 0u) s_d[r] = float16_t(acc * down_gs);
+    }
+    barrier();
+
+    uint64_t fw_a = desc.forget_w_addr;
+    uint64_t fs_a = desc.forget_s_addr;
+    uint64_t gw_a = desc.gain_w_addr;
+    uint64_t gs_a = desc.gain_s_addr;
+    float f_gs = desc.forget_gs;
+    float g_gs = desc.gain_gs;
+    uint sub = tid & 3u;
+    uint rg = tid >> 2u;
+    float out_sq = 0.0;
+    for (uint iter = 0u; iter < 36u; ++iter) {
+        uint c = rg + iter * 64u;
+        Uvec2Buf fw = Uvec2Buf(fw_a + uint64_t(c) * 32ul);
+        U8Buf fs = U8Buf(fs_a + uint64_t(c) * 4ul);
+        Uvec2Buf gw = Uvec2Buf(gw_a + uint64_t(c) * 32ul);
+        U8Buf gs = U8Buf(gs_a + uint64_t(c) * 4ul);
+        float af = nvfp4_blk16_dot_d(fw.data[sub], sub << 4u) * s_e4m3[uint(fs.data[sub])];
+        float ag = nvfp4_blk16_dot_d(gw.data[sub], sub << 4u) * s_e4m3[uint(gs.data[sub])];
+        af += subgroupShuffleXor(af, 1u);
+        af += subgroupShuffleXor(af, 2u);
+        ag += subgroupShuffleXor(ag, 1u);
+        ag += subgroupShuffleXor(ag, 2u);
+        if (sub == 0u) {
+            float merged = (1.0 - tanh(af * f_gs)) * s_m[c] + tanh(ag * g_gs) * s_msg[c];
+            s_m[c] = merged;
+            out_sq = fma(merged, merged, out_sq);
+        }
+    }
+    float sgo = subgroupAdd(out_sq);
+    if (subgroupElect()) s_r0[gl_SubgroupID] = sgo;
+    barrier();
+    if (tid == 0u) {
+        float tot = 0.0;
+        for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += s_r0[i];
+        s_inv_x = inversesqrt(tot / float(HIDDEN) + RMS_EPS);
+    }
+    barrier();
+
+    float ir = s_inv_x;
+    U16Buf nw = U16Buf(desc.post_norm_addr);
+    F32Buf ob = F32Buf(out_a + uint64_t(b * HIDDEN) * 4ul);
+    F16Buf ohb = F16Buf(outh_a + uint64_t(b * HIDDEN) * 2ul);
+    for (uint c = tid; c < HIDDEN; c += 256u) {
+        float v = s_m[c] * ir * bf16_to_f32(nw.data[c]);
+        ob.data[c] = v;
+        if (outh_a != 0ul) ohb.data[c] = float16_t(v);
+    }
+}

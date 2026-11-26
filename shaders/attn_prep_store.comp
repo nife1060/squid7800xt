@@ -1,0 +1,116 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Fused Q/R/K L2-Clip + Global Log-Pos Scale + V RMSNorm + KV Cache Store (BF16 or Q4!).
+// Grid: (B, 64, 1), Local: 128 threads (Wave64 -> 2 subgroups of 64! Exact match for group-64 Q4!).
+// WG.y:
+//   0..23:  Q heads (24 x 128) -> scale * L2-clip(QK_CLIP) * tau
+//   24..47: R heads (24 x 16)  -> scale * L2-clip(REL_CLIP) * tau
+//   48..55: K heads (8 x 128)  -> L2-clip(QK_CLIP) -> store to K cache (BF16 or Q4)
+//   56..63: V heads (8 x 128)  -> RMSNorm(128)     -> store to V cache (BF16 or Q4)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t qrgs_addr;
+    uint64_t ck_addr;
+    uint64_t cv_addr;
+    uint64_t q_clip_scale_addr;
+    uint64_t rel_clip_scale_addr;
+    uint64_t k_cache_addr;
+    uint64_t v_cache_addr;
+    uint64_t k_scale_addr; // Q4: [cap, 16] FP16
+    uint64_t v_scale_addr; // Q4: [cap, 16] FP16
+    uint64_t d_pos_addr;
+    uint kv_cap;
+    uint is_global;
+    uint kv_fmt; // 0 = BF16, 2 = Q4
+} pc;
+
+shared float s_red[4];
+
+void store_kv_128(float val, uint slot, uint h, uint tid, uint64_t cache_a, uint64_t scale_a) {
+    if (pc.kv_fmt == 0u) {
+        U16Buf dst = U16Buf(cache_a + (uint64_t(slot) * uint64_t(KV_DIM) + uint64_t(h * HEAD_DIM)) * 2ul);
+        dst.data[tid] = f32_to_bf16(val);
+    } else {
+        // Q4: signed INT4 [-7..7] + 7 stored 2 per byte; group-64 FP16 scale!
+        // With Wave64, subgroup 0 IS dims 0..63 and subgroup 1 IS dims 64..127 -> ZERO barrier needed!
+        uint g = tid >> 6u; // 0 or 1
+        float gmax = subgroupMax(abs(val));
+        float sc = max(gmax / 7.0, 1e-8);
+        if ((tid & 63u) == 0u) {
+            F16Buf sc_buf = F16Buf(q4_scale_addr(scale_a, pc.kv_cap, slot, h) + uint64_t(g * 2u));
+            sc_buf.data[0] = float16_t(sc);
+        }
+        int q = clamp(int(round(val / sc)), -7, 7) + 7; // 0..14
+        int q_odd = subgroupShuffleXor(q, 1u);
+        if ((tid & 1u) == 0u) {
+            U8Buf dst = U8Buf(q4_data_addr(cache_a, pc.kv_cap, slot, h) + uint64_t(tid >> 1u));
+            dst.data[0] = uint8_t(uint(q) | (uint(q_odd) << 4u));
+        }
+    }
+}
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    uint kind_id = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+    I32Buf pos_buf = I32Buf(pc.d_pos_addr);
+    int pos = pos_buf.data[0] + int(b);
+    float tau = 1.0;
+    if (pc.is_global != 0u) {
+        float ratio = max(float(pos + 1) / float(LOG_SCALE_FLOOR), 1.0);
+        tau = 1.0 + LOG_SCALE_ALPHA * log(ratio);
+    }
+
+    if (kind_id < 24u) {
+        uint h = kind_id;
+        F32Buf qp = F32Buf(pc.qrgs_addr + uint64_t(b * QRGS_DIM + h * HEAD_DIM) * 4ul);
+        U16Buf qcs = U16Buf(pc.q_clip_scale_addr + uint64_t(h * HEAD_DIM) * 2ul);
+        float val = qp.data[tid] * bf16_to_f32(qcs.data[tid]);
+        float sq = subgroupAdd(val * val);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sq;
+        barrier();
+        float tot = s_red[0] + s_red[1];
+        float factor = min(QK_CLIP / (sqrt(tot) + 1e-6), 1.0) * tau;
+        qp.data[tid] = val * factor;
+    } else if (kind_id < 48u) {
+        if (tid >= D_REL) return;
+        uint h = kind_id - 24u;
+        F32Buf rp = F32Buf(pc.qrgs_addr + uint64_t(b * QRGS_DIM + Q_DIM + h * D_REL) * 4ul);
+        U16Buf rcs = U16Buf(pc.rel_clip_scale_addr + uint64_t(h * D_REL) * 2ul);
+        float val = rp.data[tid] * bf16_to_f32(rcs.data[tid]);
+        float sq = val * val;
+        sq += subgroupShuffleXor(sq, 8u);
+        sq += subgroupShuffleXor(sq, 4u);
+        sq += subgroupShuffleXor(sq, 2u);
+        sq += subgroupShuffleXor(sq, 1u);
+        float factor = min(REL_CLIP / (sqrt(sq) + 1e-6), 1.0) * tau;
+        rp.data[tid] = val * factor;
+    } else if (kind_id < 56u) {
+        uint h = kind_id - 48u;
+        F32Buf kp = F32Buf(pc.ck_addr + uint64_t(b * KV_DIM + h * HEAD_DIM) * 4ul);
+        float val = kp.data[tid];
+        float sq = subgroupAdd(val * val);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sq;
+        barrier();
+        float tot = s_red[0] + s_red[1];
+        float factor = min(QK_CLIP / (sqrt(tot) + 1e-6), 1.0);
+        uint slot = uint(pos) % pc.kv_cap;
+        store_kv_128(val * factor, slot, h, tid, pc.k_cache_addr, pc.k_scale_addr);
+    } else {
+        uint h = kind_id - 56u;
+        F32Buf vp = F32Buf(pc.cv_addr + uint64_t(b * KV_DIM + h * HEAD_DIM) * 4ul);
+        float val = vp.data[tid];
+        float sq = subgroupAdd(val * val);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sq;
+        barrier();
+        float tot = s_red[0] + s_red[1];
+        float inv_rms = inversesqrt(tot / float(HEAD_DIM) + RMS_EPS);
+        uint slot = uint(pos) % pc.kv_cap;
+        store_kv_128(val * inv_rms, slot, h, tid, pc.v_cache_addr, pc.v_scale_addr);
+    }
+}

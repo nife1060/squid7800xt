@@ -1,0 +1,22 @@
+# Build outputs & Zig caches
+.zig-cache/
+.zig-global-cache/
+zig-out/
+*.exe
+*.pdb
+*.obj
+*.spv
+
+# Model weights & local toolchains
+models/
+tools/
+refs/
+*.safetensors
+*.gguf
+*.bin
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.tmp
+*.log

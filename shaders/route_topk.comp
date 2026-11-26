@@ -1,0 +1,117 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Parallel Wave64 Top-8 MoE Selection (sigmoid + bias, normalized to ROUTE_SCALE=8.0) +
+// Parallel Sorted Unique-Expert Deduplication Table (ExpertGroups) for B = 1..8!
+// ZERO serial 128-expert loops -> 100% deterministic sorted expert order across B=1..8!
+// Grid: (1, 1, 1), Local: 128 threads (2 Wave64 subgroups, 1 thread per expert 0..127).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t logits_addr;    // [B, 128] F32
+    uint64_t bias_addr;      // [128] F32
+    uint64_t out_ids_addr;   // [B, 8] I32
+    uint64_t out_w_addr;     // [B, 8] F32
+    uint64_t groups_addr;    // ExpertGroups buffer
+    uint B;                  // 1..8
+} pc;
+
+shared float s_sg_max[2];
+shared int s_win_e;
+shared float s_win_sc;
+shared int s_ids[8][TOP_K];
+shared float s_ws[8][TOP_K];
+shared uint s_sg_cnt[2];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x; // 0..127 (one expert per thread!)
+    uint sg = tid >> 6u;               // 0 or 1
+    F32Buf bias_buf = F32Buf(pc.bias_addr);
+    float rb = bias_buf.data[tid];
+
+    I32Buf ids_out = I32Buf(pc.out_ids_addr);
+    F32Buf w_out = F32Buf(pc.out_w_addr);
+
+    // Per-expert tracking across all B tokens (all 128 experts in parallel!)
+    uint my_tmask = 0u;
+    uint my_slot[8];
+    float my_rw[8];
+    for (uint b = 0u; b < 8u; ++b) { my_slot[b] = 0u; my_rw[b] = 0.0; }
+
+    for (uint b = 0u; b < pc.B; ++b) {
+        F32Buf lg_buf = F32Buf(pc.logits_addr + uint64_t(b * NUM_EXPERTS) * 4ul);
+        float raw = fast_sigmoid(lg_buf.data[tid]);
+        float bi = raw + rb;
+        bool alive = true;
+        float chosen_sum = 0.0;
+
+        for (uint k = 0u; k < TOP_K; ++k) {
+            float cur = alive ? bi : -1e30;
+            float sm = subgroupMax(cur);
+            if (subgroupElect()) s_sg_max[sg] = sm;
+            barrier();
+
+            float gmax = max(s_sg_max[0], s_sg_max[1]);
+            uint win_sg = (s_sg_max[0] >= s_sg_max[1]) ? 0u : 1u;
+            uvec4 bal = subgroupBallot(alive && (bi == gmax));
+            if (sg == win_sg) {
+                uint win_lane = subgroupBallotFindLSB(bal);
+                if ((tid & 63u) == win_lane) {
+                    s_win_e = int(tid);
+                    s_win_sc = raw;
+                    alive = false;
+                }
+            }
+            barrier();
+
+            int we = s_win_e;
+            float wsc = s_win_sc;
+            chosen_sum += wsc;
+            if (tid == 0u) {
+                s_ids[b][k] = we;
+                s_ws[b][k] = wsc;
+            }
+            if (int(tid) == we) {
+                my_tmask |= (1u << b);
+                my_slot[b] = k;
+                my_rw[b] = wsc;
+            }
+            barrier();
+        }
+
+        float inv = ROUTE_SCALE / (chosen_sum + 1e-20);
+        if ((my_tmask & (1u << b)) != 0u) my_rw[b] *= inv;
+        if (tid < TOP_K) {
+            float nw = s_ws[b][tid] * inv;
+            ids_out.data[b * TOP_K + tid] = s_ids[b][tid];
+            w_out.data[b * TOP_K + tid] = nw;
+        }
+    }
+
+    // Parallel sorted ExpertGroups compaction across all 128 experts!
+    if (pc.groups_addr == 0ul) return;
+    uint is_used = (my_tmask != 0u) ? 1u : 0u;
+    uint sg_off = subgroupExclusiveAdd(is_used);
+    uint sg_tot = subgroupAdd(is_used);
+    if (subgroupElect()) s_sg_cnt[sg] = sg_tot;
+    barrier();
+
+    U32Buf g_u32 = U32Buf(pc.groups_addr);
+    F32Buf g_f32 = F32Buf(pc.groups_addr);
+    if (tid == 0u) {
+        g_u32.data[0u] = s_sg_cnt[0] + s_sg_cnt[1];
+    }
+    if (is_used != 0u) {
+        uint u = sg_off + ((sg == 1u) ? s_sg_cnt[0] : 0u);
+        g_u32.data[1u + u] = tid;
+        g_u32.data[65u + u] = my_tmask;
+        for (uint b = 0u; b < pc.B; ++b) {
+            if ((my_tmask & (1u << b)) != 0u) {
+                g_u32.data[129u + u * 8u + b] = my_slot[b];
+                g_f32.data[641u + u * 8u + b] = my_rw[b];
+            }
+        }
+    }
+}

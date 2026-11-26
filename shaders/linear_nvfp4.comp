@@ -1,0 +1,113 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// High-bandwidth Persistent Wave64 LDS-LUT256 NVFP4 Linear GEMV / Small-Batch (B = 1..8).
+// Uses Vulkan Specialization Constant SPEC_B (1, 2, 3, 4, 7, 8) + 16-byte uvec4 X loads!
+// Grid: (min((rows + 15) / 16, 240), 1, 1), Local: 256 threads (Wave64).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint SPEC_B = 1u;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t s_addr;
+    uint64_t x_h_addr; // [B, cols] FP16 (16-byte aligned, cols % 16 == 0)
+    uint64_t y_addr;   // [B, rows] F32
+    uint rows;
+    uint cols;
+    float global_scale;
+    uint B;
+    uint add_residual;
+} pc;
+
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+
+float dot16_h2(
+    f16vec2 wh0, f16vec2 wh1, f16vec2 wh2, f16vec2 wh3,
+    f16vec2 wh4, f16vec2 wh5, f16vec2 wh6, f16vec2 wh7,
+    F16Vec2Buf x_buf, uint xo
+) {
+    f16vec2 p0 = wh0 * x_buf.data[xo + 0u];
+    f16vec2 p1 = wh1 * x_buf.data[xo + 1u];
+    p0 = fma(wh2, x_buf.data[xo + 2u], p0);
+    p1 = fma(wh3, x_buf.data[xo + 3u], p1);
+    p0 = fma(wh4, x_buf.data[xo + 4u], p0);
+    p1 = fma(wh5, x_buf.data[xo + 5u], p1);
+    p0 = fma(wh6, x_buf.data[xo + 6u], p0);
+    p1 = fma(wh7, x_buf.data[xo + 7u], p1);
+    f16vec2 s2 = p0 + p1;
+    return float(s2.x) + float(s2.y);
+}
+
+void store_out(F32Buf y_buf, uint b, uint row, uint lane16, float v) {
+    v += subgroupShuffleXor(v, 8u);
+    v += subgroupShuffleXor(v, 4u);
+    v += subgroupShuffleXor(v, 2u);
+    v += subgroupShuffleXor(v, 1u);
+    if (lane16 == 0u) {
+        uint idx = b * pc.rows + row;
+        float res = v * pc.global_scale;
+        if (pc.add_residual != 0u) y_buf.data[idx] += res;
+        else y_buf.data[idx] = res;
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
+    s_e4m3[tid] = decode_e4m3(tid);
+    barrier();
+
+    uint row_in_wg = tid >> 4u;
+    uint lane16 = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + row_in_wg;
+    if (row >= pc.rows) return;
+
+    uint n_blocks16 = pc.cols >> 4u;
+    uint cols_h2 = pc.cols >> 1u;
+    F16Vec2Buf x_buf = F16Vec2Buf(pc.x_h_addr);
+    F32Buf y_buf = F32Buf(pc.y_addr);
+
+    {
+        Uvec2Buf w_buf = Uvec2Buf(pc.w_addr + uint64_t(row) * uint64_t(n_blocks16) * 8ul);
+        U8Buf s_buf = U8Buf(pc.s_addr + uint64_t(row) * uint64_t(n_blocks16));
+
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        float a4 = 0.0, a5 = 0.0, a6 = 0.0, a7 = 0.0;
+
+        for (uint blk = lane16; blk < n_blocks16; blk += 16u) {
+            uvec2 w8 = w_buf.data[blk];
+            float sc = s_e4m3[uint(s_buf.data[blk])];
+
+            f16vec2 wh0 = s_e2m1x2[w8.x & 0xFFu];
+            f16vec2 wh1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu];
+            f16vec2 wh2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu];
+            f16vec2 wh3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu];
+            f16vec2 wh4 = s_e2m1x2[w8.y & 0xFFu];
+            f16vec2 wh5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu];
+            f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
+            f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
+
+            uint xb = blk * 8u;
+            a0 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, xb), sc, a0);
+            if (SPEC_B >= 2u) a1 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, cols_h2 + xb), sc, a1);
+            if (SPEC_B >= 3u) a2 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 2u * cols_h2 + xb), sc, a2);
+            if (SPEC_B >= 4u) a3 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 3u * cols_h2 + xb), sc, a3);
+            if (SPEC_B >= 5u) a4 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 4u * cols_h2 + xb), sc, a4);
+            if (SPEC_B >= 6u) a5 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 5u * cols_h2 + xb), sc, a5);
+            if (SPEC_B >= 7u) a6 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 6u * cols_h2 + xb), sc, a6);
+            if (SPEC_B >= 8u) a7 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 7u * cols_h2 + xb), sc, a7);
+        }
+
+        store_out(y_buf, 0u, row, lane16, a0);
+        if (SPEC_B >= 2u) store_out(y_buf, 1u, row, lane16, a1);
+        if (SPEC_B >= 3u) store_out(y_buf, 2u, row, lane16, a2);
+        if (SPEC_B >= 4u) store_out(y_buf, 3u, row, lane16, a3);
+        if (SPEC_B >= 5u) store_out(y_buf, 4u, row, lane16, a4);
+        if (SPEC_B >= 6u) store_out(y_buf, 5u, row, lane16, a5);
+        if (SPEC_B >= 7u) store_out(y_buf, 6u, row, lane16, a6);
+        if (SPEC_B >= 8u) store_out(y_buf, 7u, row, lane16, a7);
+    }
+}

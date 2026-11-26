@@ -1,0 +1,189 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// DSpark Utility Ops (6 modes in 1 compact Wave64 shader):
+// mode == 0: init_block (Grid=(8,1,1), Local=128): row 0 = embed_norm(anchor), rows 1..7 = mask_embed
+// mode == 1: rmsnorm_h  (Grid=(B,1,1), Local=128): RMSNorm(x, w) -> optional out_f + out_h
+// mode == 2: block_qk_rope (Grid=(8,32,1), Local=128): per-head Q/K RMSNorm + NeoX RoPE(pos+r)
+// mode == 3: swiglu_h   (Grid=((B*9216+127)/128,1,1), Local=128): SiLU(gate)*up -> F16
+// mode == 4: copy_f_zero_state (Grid=((2304+127)/128,1,1), Local=128): copy f_ring[(pos-1)&15] + zero state[256]
+// mode == 5: spec_verify (Grid=(1,1,1), Local=128): compare target_preds[0..B-1] vs drafts[0..B-2], update pos & anchor!
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t a0;
+    uint64_t a1;
+    uint64_t a2;
+    uint64_t a3;
+    uint64_t a4;
+    uint64_t a5;
+    uint64_t a6;
+    uint param0;
+    uint mode;
+} pc;
+
+shared float s_red[4];
+shared float s_vn[HEAD_DIM];
+shared float s_inv_rms;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    if (pc.mode == 0u) {
+        // a0=embed, a1=embed_norm, a2=mask_embed, a3=d_anchor, a4=block_x
+        uint r = gl_WorkGroupID.x;
+        F32Buf dst = F32Buf(pc.a4 + uint64_t(r * HIDDEN) * 4ul);
+        if (r == 0u) {
+            I32Buf anc = I32Buf(pc.a3);
+            int tok = anc.data[0];
+            U16Buf row = U16Buf(pc.a0 + uint64_t(uint(tok)) * uint64_t(HIDDEN) * 2ul);
+            U16Buf nw = U16Buf(pc.a1);
+            float sq = 0.0;
+            for (uint d = tid; d < HIDDEN; d += 128u) {
+                float v = bf16_to_f32(row.data[d]);
+                sq = fma(v, v, sq);
+            }
+            float sg = subgroupAdd(sq);
+            if (subgroupElect()) s_red[gl_SubgroupID] = sg;
+            barrier();
+            if (tid == 0u) s_inv_rms = inversesqrt((s_red[0] + s_red[1]) / float(HIDDEN) + RMS_EPS);
+            barrier();
+            float ir = s_inv_rms;
+            for (uint d = tid; d < HIDDEN; d += 128u) {
+                dst.data[d] = bf16_to_f32(row.data[d]) * ir * bf16_to_f32(nw.data[d]);
+            }
+        } else {
+            U16Buf me = U16Buf(pc.a2);
+            for (uint d = tid; d < HIDDEN; d += 128u) {
+                dst.data[d] = bf16_to_f32(me.data[d]);
+            }
+        }
+        return;
+    }
+
+    if (pc.mode == 1u) {
+        // a0=x_f32, a1=w_bf16, a2=out_f32 (opt), a3=out_f16
+        uint r = gl_WorkGroupID.x;
+        F32Buf xb = F32Buf(pc.a0 + uint64_t(r * HIDDEN) * 4ul);
+        U16Buf nw = U16Buf(pc.a1);
+        float sq = 0.0;
+        for (uint d = tid; d < HIDDEN; d += 128u) {
+            float v = xb.data[d];
+            sq = fma(v, v, sq);
+        }
+        float sg = subgroupAdd(sq);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sg;
+        barrier();
+        if (tid == 0u) s_inv_rms = inversesqrt((s_red[0] + s_red[1]) / float(HIDDEN) + RMS_EPS);
+        barrier();
+        float ir = s_inv_rms;
+        F16Buf oh = F16Buf(pc.a3 + uint64_t(r * HIDDEN) * 2ul);
+        for (uint d = tid; d < HIDDEN; d += 128u) {
+            float v = xb.data[d] * ir * bf16_to_f32(nw.data[d]);
+            oh.data[d] = float16_t(v);
+            if (pc.a2 != 0ul) {
+                F32Buf of = F32Buf(pc.a2 + uint64_t(r * HIDDEN) * 4ul);
+                of.data[d] = v;
+            }
+        }
+        return;
+    }
+
+    if (pc.mode == 2u) {
+        // a0=qkv [8, 5120], a1=q_norm, a2=k_norm, a3=d_pos
+        uint r = gl_WorkGroupID.x;
+        uint h = gl_WorkGroupID.y; // 0..23 Q, 24..31 K
+        I32Buf pos_buf = I32Buf(pc.a3);
+        int pos = pos_buf.data[0] + int(r);
+        const uint QKV_STRIDE = Q_DIM + 2u * KV_DIM;
+        uint64_t v_off = (h < 24u)
+            ? uint64_t(r * QKV_STRIDE + h * HEAD_DIM) * 4ul
+            : uint64_t(r * QKV_STRIDE + Q_DIM + (h - 24u) * HEAD_DIM) * 4ul;
+        F32Buf vec = F32Buf(pc.a0 + v_off);
+        U16Buf nw = U16Buf((h < 24u) ? pc.a1 : pc.a2);
+        float val = vec.data[tid];
+        float sq = subgroupAdd(val * val);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sq;
+        barrier();
+        float ir = inversesqrt((s_red[0] + s_red[1]) / float(HEAD_DIM) + RMS_EPS);
+        s_vn[tid] = val * ir * bf16_to_f32(nw.data[tid]);
+        barrier();
+        if (tid < 64u) {
+            float freq = 1.0 / pow(1000000.0, float(2u * tid) / float(HEAD_DIM));
+            float ang = float(pos) * freq;
+            float c = cos(ang), s = sin(ang);
+            float x0 = s_vn[tid], x1 = s_vn[tid + 64u];
+            vec.data[tid]       = x0 * c - x1 * s;
+            vec.data[tid + 64u] = x0 * s + x1 * c;
+        }
+        return;
+    }
+
+    if (pc.mode == 3u) {
+        // a0=gu [B, 2*9216], a1=out_h [B, 9216], param0=B
+        uint idx = gl_GlobalInvocationID.x;
+        uint total = pc.param0 * MTP_INTERMEDIATE;
+        if (idx >= total) return;
+        uint b = idx / MTP_INTERMEDIATE;
+        uint j = idx % MTP_INTERMEDIATE;
+        F32Buf gu = F32Buf(pc.a0 + uint64_t(b * (2u * MTP_INTERMEDIATE)) * 4ul);
+        float g = gu.data[j];
+        float u = gu.data[MTP_INTERMEDIATE + j];
+        F16Buf out_h = F16Buf(pc.a1);
+        out_h.data[idx] = float16_t((g * fast_sigmoid(g)) * u);
+        return;
+    }
+
+    if (pc.mode == 4u) {
+        // a0=f_ring, a1=d_pos, a2=out_f [2304], a3=state [256]
+        uint i = gl_GlobalInvocationID.x;
+        I32Buf pos_buf = I32Buf(pc.a1);
+        int prev_p = pos_buf.data[0] - 1;
+        if (i < HIDDEN) {
+            F32Buf out_f = F32Buf(pc.a2);
+            if (prev_p >= 0) {
+                F32Buf fr = F32Buf(pc.a0 + uint64_t(uint(prev_p & 15) * HIDDEN) * 4ul);
+                out_f.data[i] = fr.data[i];
+            } else {
+                out_f.data[i] = 0.0;
+            }
+        }
+        if (i < MTP_MARKOV_RANK) {
+            F32Buf st = F32Buf(pc.a3);
+            st.data[i] = 0.0;
+        }
+        return;
+    }
+
+    // mode == 5: spec_verify
+    // a0=target_preds [B], a1=draft_tokens [B-1], a2=out_accepted [B], a3=out_num_acc [1],
+    // a4=d_pos [1], a5=d_anchor [1], a6=d_tokens [B], param0=B
+    if (tid == 0u) {
+        I32Buf tp_buf = I32Buf(pc.a0);
+        I32Buf dr_buf = I32Buf(pc.a1);
+        I32Buf acc_buf = I32Buf(pc.a2);
+        I32Buf nacc_buf = I32Buf(pc.a3);
+        I32Buf pos_buf = I32Buf(pc.a4);
+        I32Buf anc_buf = I32Buf(pc.a5);
+        int n_acc = 0;
+        for (uint i = 0u; i + 1u < pc.param0; ++i) {
+            int tp = tp_buf.data[i];
+            acc_buf.data[n_acc] = tp;
+            n_acc += 1;
+            if (tp != dr_buf.data[i]) {
+                nacc_buf.data[0] = n_acc;
+                pos_buf.data[0] += n_acc;
+                anc_buf.data[0] = tp;
+                return;
+            }
+        }
+        int bonus = tp_buf.data[pc.param0 - 1u];
+        acc_buf.data[n_acc] = bonus;
+        n_acc += 1;
+        nacc_buf.data[0] = n_acc;
+        pos_buf.data[0] += n_acc;
+        anc_buf.data[0] = bonus;
+    }
+}

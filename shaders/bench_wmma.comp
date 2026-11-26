@@ -1,0 +1,93 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+
+// RDNA 3 WMMA FP16 GEMM ceiling microbenchmark (16x16x16 cooperative matrix, Wave32).
+// Workgroup = 4 Wave32s (128 threads), computes 64x64 output tile (2x2 WMMA tiles per wave).
+// C[M, N] = A[M, K] * B^T[N, K]
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer F16Buf {
+    float16_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 16) writeonly buffer F32Buf {
+    float data[];
+};
+
+layout(push_constant) uniform PC {
+    uint64_t a_addr;
+    uint64_t b_addr;
+    uint64_t c_addr;
+    uint M;
+    uint N;
+    uint K;
+} pc;
+
+shared float16_t smA[64 * 36];
+shared float16_t smB[64 * 36];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wave_id = tid >> 5u;
+    uint wy = wave_id >> 1u; // 0..1 (each covers 32 rows)
+    uint wx = wave_id & 1u;  // 0..1 (each covers 32 cols)
+
+    uint m0 = gl_WorkGroupID.y * 64u;
+    uint n0 = gl_WorkGroupID.x * 64u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += 32u) {
+        // Load 64x32 tile of A and 64x32 tile of B (2048 f16s each = 16 f16s per thread)
+        for (uint idx = tid; idx < 64u * 32u / 4u; idx += 128u) {
+            uint r = idx >> 3u;       // 0..63
+            uint c4 = (idx & 7u) * 4u; // 0..28
+            F16Buf Arow = F16Buf(pc.a_addr + (uint64_t(m0 + r) * uint64_t(pc.K) + uint64_t(k0 + c4)) * 2ul);
+            F16Buf Brow = F16Buf(pc.b_addr + (uint64_t(n0 + r) * uint64_t(pc.K) + uint64_t(k0 + c4)) * 2ul);
+            uint base = r * 36u + c4;
+            smA[base + 0u] = Arow.data[0u];
+            smA[base + 1u] = Arow.data[1u];
+            smA[base + 2u] = Arow.data[2u];
+            smA[base + 3u] = Arow.data[3u];
+            smB[base + 0u] = Brow.data[0u];
+            smB[base + 1u] = Brow.data[1u];
+            smB[base + 2u] = Brow.data[2u];
+            smB[base + 3u] = Brow.data[3u];
+        }
+        barrier();
+
+        for (uint ks = 0u; ks < 32u; ks += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA[2];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB[2];
+            coopMatLoad(matA[0], smA, (wy * 32u + 0u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matA[1], smA, (wy * 32u + 16u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matB[0], smB, (wx * 32u + 0u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(matB[1], smB, (wx * 32u + 16u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutColumnMajor);
+
+            acc[0][0] = coopMatMulAdd(matA[0], matB[0], acc[0][0]);
+            acc[0][1] = coopMatMulAdd(matA[0], matB[1], acc[0][1]);
+            acc[1][0] = coopMatMulAdd(matA[1], matB[0], acc[1][0]);
+            acc[1][1] = coopMatMulAdd(matA[1], matB[1], acc[1][1]);
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < 2u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            uint row = m0 + wy * 32u + i * 16u;
+            uint col = n0 + wx * 32u + j * 16u;
+            F32Buf Ctile = F32Buf(pc.c_addr + (uint64_t(row) * uint64_t(pc.N) + uint64_t(col)) * 4ul);
+            coopMatStore(acc[i][j], Ctile.data, 0u, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

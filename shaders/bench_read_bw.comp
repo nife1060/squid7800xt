@@ -1,0 +1,46 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer Uvec4Buf {
+    uvec4 data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer UintBuf {
+    uint data[];
+};
+
+layout(push_constant) uniform PC {
+    uint64_t src_addr;
+    uint64_t dst_addr;
+    uint n_vec4;
+    uint stride_vec4;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total_threads = gl_NumWorkGroups.x * 256u;
+    Uvec4Buf src = Uvec4Buf(pc.src_addr);
+
+    uvec4 acc0 = uvec4(0u);
+    uvec4 acc1 = uvec4(0u);
+    uint i = gid;
+    uint step2 = total_threads * 2u;
+    while (i + total_threads < pc.n_vec4) {
+        acc0 ^= src.data[i];
+        acc1 ^= src.data[i + total_threads];
+        i += step2;
+    }
+    if (i < pc.n_vec4) {
+        acc0 ^= src.data[i];
+    }
+    uvec4 acc = acc0 ^ acc1;
+    uint fold = acc.x ^ acc.y ^ acc.z ^ acc.w;
+    if (fold == 0xdeadbeefu) {
+        UintBuf dst = UintBuf(pc.dst_addr);
+        dst.data[gid & 255u] = fold;
+    }
+}

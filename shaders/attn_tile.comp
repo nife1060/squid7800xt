@@ -1,0 +1,298 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#extension GL_EXT_control_flow_attributes : require
+
+// Stage 1: Tiled split attention over KV context (Q4 head-major or BF16), shared by
+//   * target global layers (bulk + 1024-token rel-bias tail in ONE pass),
+//   * target local SWA layers (window = 1024),
+//   * DSpark ctx attention (global or local, 8 block rows, no rel bias).
+//
+// Grid: (NUM_KV_HEADS, n_splits_dispatched, row_groups). Local: 64 (exactly one Wave64).
+// Each wave owns one split of the visible range and serves ALL SPEC_B rows x 3 GQA heads
+// from the same KV bytes: every K/V tile is fetched once per KV head per step,
+// independent of B (MTP verify) and of GQA.
+//
+// Tile = 16 tokens; lane = token(16) x dim-slice(4) -> each lane fetches one 16 B uvec4
+// of Q4 K (32 dims) + one of V per tile (4 for BF16). Next tile is prefetched into
+// registers while the current one is consumed. Softmax is updated once per tile per row.
+// No workgroup barriers in the token loop.
+//
+// Visibility of row b (global row index = group * SPEC_B + b):
+//   last_b  = pos0 + last_off + row * row_step         (inclusive)
+//   first_b = max(0, last_b + 1 - span)
+// Rel-position bias (target layers): + r_h . rel_proj[:, last_b - t] when last_b - t < 1024.
+// Writes unnormalized partials (m, d, o[128]) per (head, row, split) for attn_merge_gate.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint SPEC_B = 1u;
+const uint ROWS = 3u * SPEC_B;
+
+layout(push_constant) uniform PC {
+    uint64_t q_addr;        // row 0, head 0 (F32), row stride q_row_stride floats
+    uint64_t r_addr;        // rel queries row 0, head 0 (F32) or 0
+    uint64_t rel_proj_addr; // [16, 1024] BF16 or 0 (no bias)
+    uint64_t k_cache_addr;
+    uint64_t v_cache_addr;
+    uint64_t k_scale_addr;
+    uint64_t v_scale_addr;
+    uint64_t split_buf_addr;
+    uint64_t d_pos_addr;
+    uint q_row_stride;
+    uint cap;
+    uint kv_fmt;      // 0 = BF16, 2 = Q4
+    uint span;        // visible span (window, or cap for global)
+    int last_off;
+    uint row_step;
+    uint rows_total;  // split-buffer row dimension
+    uint n_split_max; // split-buffer split dimension
+} pc;
+
+shared vec4 s_q[ROWS * (HEAD_DIM / 4u)];
+shared float s_rq[ROWS * D_REL];
+shared uint s_v[ATTN_TILE * (HEAD_DIM / 2u)]; // [tok][64 x f16vec2]
+shared float s_p[ROWS * ATTN_TILE];      // scores, then probabilities (in place)
+shared float s_alpha[ROWS];
+
+struct RawKV {
+    uvec4 k0, k1, k2, k3;
+    uvec4 v0, v1, v2, v3;
+    uint ks, vs;
+};
+
+RawKV load_raw(int t, bool valid, uint kvh, uint j) {
+    RawKV r;
+    r.k0 = uvec4(0u); r.k1 = uvec4(0u); r.k2 = uvec4(0u); r.k3 = uvec4(0u);
+    r.v0 = uvec4(0u); r.v1 = uvec4(0u); r.v2 = uvec4(0u); r.v3 = uvec4(0u);
+    r.ks = 0u; r.vs = 0u;
+    if (!valid) return r;
+    uint slot = uint(t) % pc.cap;
+    if (pc.kv_fmt == 0u) {
+        uint64_t off = (uint64_t(slot) * uint64_t(KV_DIM) + uint64_t(kvh * HEAD_DIM + j * 32u)) * 2ul;
+        Uvec4Buf kb = Uvec4Buf(pc.k_cache_addr + off);
+        Uvec4Buf vb = Uvec4Buf(pc.v_cache_addr + off);
+        r.k0 = kb.data[0]; r.k1 = kb.data[1]; r.k2 = kb.data[2]; r.k3 = kb.data[3];
+        r.v0 = vb.data[0]; r.v1 = vb.data[1]; r.v2 = vb.data[2]; r.v3 = vb.data[3];
+    } else {
+        r.k0 = Uvec4Buf(q4_data_addr(pc.k_cache_addr, pc.cap, slot, kvh) + uint64_t(j * 16u)).data[0];
+        r.v0 = Uvec4Buf(q4_data_addr(pc.v_cache_addr, pc.cap, slot, kvh) + uint64_t(j * 16u)).data[0];
+        r.ks = U32Buf(q4_scale_addr(pc.k_scale_addr, pc.cap, slot, kvh)).data[0];
+        r.vs = U32Buf(q4_scale_addr(pc.v_scale_addr, pc.cap, slot, kvh)).data[0];
+    }
+    return r;
+}
+
+// 8 dims (c-th chunk of this lane's 32-dim slice) as float, scale NOT applied for Q4.
+void unpack_q4_word(uint w, out vec4 a, out vec4 b) {
+    a = vec4(float(int(w & 0xFu)), float(int((w >> 4u) & 0xFu)),
+             float(int((w >> 8u) & 0xFu)), float(int((w >> 12u) & 0xFu))) - 7.0;
+    b = vec4(float(int((w >> 16u) & 0xFu)), float(int((w >> 20u) & 0xFu)),
+             float(int((w >> 24u) & 0xFu)), float(int((w >> 28u) & 0xFu))) - 7.0;
+}
+void unpack_bf16_vec(uvec4 u, out vec4 a, out vec4 b) {
+    a = vec4(uintBitsToFloat(u.x << 16u), uintBitsToFloat(u.x & 0xFFFF0000u),
+             uintBitsToFloat(u.y << 16u), uintBitsToFloat(u.y & 0xFFFF0000u));
+    b = vec4(uintBitsToFloat(u.z << 16u), uintBitsToFloat(u.z & 0xFFFF0000u),
+             uintBitsToFloat(u.w << 16u), uintBitsToFloat(u.w & 0xFFFF0000u));
+}
+
+void main() {
+    uint kvh = gl_WorkGroupID.x;
+    uint split = gl_WorkGroupID.y;
+    uint grp = gl_WorkGroupID.z;
+    uint lane = gl_LocalInvocationID.x;
+    uint tl = lane >> 2u; // token within tile
+    uint j = lane & 3u;   // 32-dim slice
+
+    int pos0 = I32Buf(pc.d_pos_addr).data[0];
+    uint row0 = grp * SPEC_B;
+    int last0 = pos0 + pc.last_off + int(row0 * pc.row_step);
+    int lastN = last0 + int((SPEC_B - 1u) * pc.row_step);
+    int lo = max(0, last0 + 1 - int(pc.span));
+    int hi = lastN + 1;
+    uvec2 lay = attn_split_layout(lo, hi, pc.n_split_max);
+    if (split >= lay.y) return;
+    int t_begin = lo + int(split * lay.x * ATTN_TILE);
+    int t_end = min(hi, t_begin + int(lay.x * ATTN_TILE));
+
+    // Stage Q (and rel-Q) rows for this KV head: row r = b * 3 + hh.
+    bool use_bias = (pc.rel_proj_addr != 0ul);
+    for (uint i = lane; i < ROWS * (HEAD_DIM / 4u); i += 64u) {
+        uint r = i / (HEAD_DIM / 4u);
+        uint c = i % (HEAD_DIM / 4u);
+        uint b = r / 3u;
+        uint hh = r % 3u;
+        Vec4Buf qb = Vec4Buf(pc.q_addr + uint64_t((row0 + b) * pc.q_row_stride + (kvh * GQA_RATIO + hh) * HEAD_DIM) * 4ul);
+        s_q[i] = qb.data[c];
+    }
+    if (use_bias) {
+        for (uint i = lane; i < ROWS * D_REL; i += 64u) {
+            uint r = i / D_REL;
+            uint k = i % D_REL;
+            uint b = r / 3u;
+            uint hh = r % 3u;
+            F32Buf rb = F32Buf(pc.r_addr + uint64_t((row0 + b) * pc.q_row_stride + (kvh * GQA_RATIO + hh) * D_REL) * 4ul);
+            s_rq[i] = rb.data[k];
+        }
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    // Row-owner softmax state: lane r (< ROWS) owns (m, l) of row r. No cross-lane reductions
+    // per row: scores go through LDS and each owner lane scans its 16 tokens serially.
+    float m_own = -1e30;
+    float l_own = 0.0;
+    vec2 o_s[ROWS];
+    [[unroll]] for (uint r = 0u; r < ROWS; ++r) o_s[r] = vec2(0.0);
+
+    U16Buf relp = U16Buf(pc.rel_proj_addr);
+
+    int t0 = t_begin + int(tl);
+    RawKV cur = load_raw(t0, t0 < t_end, kvh, j);
+
+    for (int tb = t_begin; tb < t_end; tb += int(ATTN_TILE)) {
+        int t = tb + int(tl);
+        bool tv = t < t_end;
+        int tn = t + int(ATTN_TILE);
+        RawKV nxt = load_raw(tn, tn < t_end, kvh, j); // prefetch next tile
+
+        // ---- Decode this lane's 32 K dims ----
+        float ksc = 1.0;
+        float vsc = 1.0;
+        if (pc.kv_fmt != 0u) {
+            vec2 kss = unpackHalf2x16(cur.ks);
+            vec2 vss = unpackHalf2x16(cur.vs);
+            ksc = (j < 2u) ? kss.x : kss.y;
+            vsc = (j < 2u) ? vss.x : vss.y;
+        }
+        vec4 kf[8];
+        if (pc.kv_fmt == 0u) {
+            unpack_bf16_vec(cur.k0, kf[0], kf[1]);
+            unpack_bf16_vec(cur.k1, kf[2], kf[3]);
+            unpack_bf16_vec(cur.k2, kf[4], kf[5]);
+            unpack_bf16_vec(cur.k3, kf[6], kf[7]);
+        } else {
+            unpack_q4_word(cur.k0.x, kf[0], kf[1]);
+            unpack_q4_word(cur.k0.y, kf[2], kf[3]);
+            unpack_q4_word(cur.k0.z, kf[4], kf[5]);
+            unpack_q4_word(cur.k0.w, kf[6], kf[7]);
+        }
+        float dscale = ksc * INV_SQRT_HEAD_DIM;
+
+        // ---- Stage V tile (f16) for the PV pass: s_v[tok][dim/2] ----
+        {
+            uint base = tl * (HEAD_DIM / 2u) + j * 16u;
+            if (pc.kv_fmt == 0u) {
+                uvec4 vv[4] = uvec4[4](cur.v0, cur.v1, cur.v2, cur.v3);
+                [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+                    vec4 a, b;
+                    unpack_bf16_vec(vv[c], a, b);
+                    s_v[base + c * 4u + 0u] = packHalf2x16(a.xy);
+                    s_v[base + c * 4u + 1u] = packHalf2x16(a.zw);
+                    s_v[base + c * 4u + 2u] = packHalf2x16(b.xy);
+                    s_v[base + c * 4u + 3u] = packHalf2x16(b.zw);
+                }
+            } else {
+                uint vw[4] = uint[4](cur.v0.x, cur.v0.y, cur.v0.z, cur.v0.w);
+                [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+                    vec4 a, b;
+                    unpack_q4_word(vw[c], a, b);
+                    a *= vsc; b *= vsc;
+                    s_v[base + c * 4u + 0u] = packHalf2x16(a.xy);
+                    s_v[base + c * 4u + 1u] = packHalf2x16(a.zw);
+                    s_v[base + c * 4u + 2u] = packHalf2x16(b.xy);
+                    s_v[base + c * 4u + 3u] = packHalf2x16(b.zw);
+                }
+            }
+        }
+
+        // Does any row need the rel-position bias in this tile? (wave-uniform)
+        int tile_last_tok = min(tb + int(ATTN_TILE), t_end) - 1;
+        bool tile_bias = use_bias && (last0 - tile_last_tok) < int(REL_EXTENT);
+
+        // ---- Scores + online softmax, one update per row per tile ----
+        [[unroll]] for (uint b = 0u; b < SPEC_B; ++b) {
+            int last_b = last0 + int(b * pc.row_step);
+            int first_b = max(0, last_b + 1 - int(pc.span));
+            bool vis = tv && (t >= first_b) && (t <= last_b);
+            int dist = last_b - t;
+            vec4 relw = vec4(0.0);
+            if (tile_bias && vis && dist < int(REL_EXTENT)) {
+                uint dd = uint(dist);
+                uint k0 = j * 4u;
+                relw = vec4(bf16_to_f32(relp.data[(k0 + 0u) * REL_EXTENT + dd]),
+                            bf16_to_f32(relp.data[(k0 + 1u) * REL_EXTENT + dd]),
+                            bf16_to_f32(relp.data[(k0 + 2u) * REL_EXTENT + dd]),
+                            bf16_to_f32(relp.data[(k0 + 3u) * REL_EXTENT + dd]));
+            }
+            [[unroll]] for (uint hh = 0u; hh < 3u; ++hh) {
+                uint r = b * 3u + hh;
+                uint qb = r * (HEAD_DIM / 4u) + j * 8u;
+                float part = 0.0;
+                [[unroll]] for (uint c = 0u; c < 8u; ++c) part += dot(s_q[qb + c], kf[c]);
+                part *= dscale;
+                if (tile_bias) {
+                    uint rb = r * D_REL + j * 4u;
+                    part += dot(vec4(s_rq[rb], s_rq[rb + 1u], s_rq[rb + 2u], s_rq[rb + 3u]), relw);
+                }
+                part += subgroupShuffleXor(part, 1u);
+                part += subgroupShuffleXor(part, 2u);
+                if (j == 0u) s_p[r * ATTN_TILE + tl] = vis ? part : -1e30;
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // ---- Online softmax: owner lane r scans its row's 16 scores (scores -> probs in place) ----
+        if (lane < ROWS) {
+            uint rb = lane * ATTN_TILE;
+            float mt = -1e30;
+            [[unroll]] for (uint tt = 0u; tt < ATTN_TILE; ++tt) mt = max(mt, s_p[rb + tt]);
+            float m_new = max(m_own, mt);
+            float alpha = exp(m_own - m_new);
+            float lsum = 0.0;
+            [[unroll]] for (uint tt = 0u; tt < ATTN_TILE; ++tt) {
+                float sc = s_p[rb + tt];
+                float pw = (sc > -1e29) ? exp(sc - m_new) : 0.0;
+                s_p[rb + tt] = pw;
+                lsum += pw;
+            }
+            l_own = l_own * alpha + lsum;
+            m_own = m_new;
+            s_alpha[lane] = alpha;
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // ---- PV: lane owns dims (2*lane, 2*lane+1) ----
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r) o_s[r] *= s_alpha[r];
+        [[unroll]] for (uint tt = 0u; tt < ATTN_TILE; ++tt) {
+            vec2 v2 = unpackHalf2x16(s_v[tt * (HEAD_DIM / 2u) + lane]);
+            [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
+                o_s[r] = fma(vec2(s_p[r * ATTN_TILE + tt]), v2, o_s[r]);
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        cur = nxt;
+    }
+
+    uint E = NUM_HEADS * pc.rows_total * pc.n_split_max;
+    F32Buf s_m_out = F32Buf(pc.split_buf_addr);
+    F32Buf s_d_out = F32Buf(pc.split_buf_addr + uint64_t(E) * 4ul);
+    [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
+        uint b = r / 3u;
+        uint hh = r % 3u;
+        uint h = kvh * GQA_RATIO + hh;
+        uint idx = (h * pc.rows_total + row0 + b) * pc.n_split_max + split;
+        if (lane == r) {
+            s_m_out.data[idx] = m_own;
+            s_d_out.data[idx] = l_own;
+        }
+        F32Buf s_o_out = F32Buf(pc.split_buf_addr + (uint64_t(2u * E) + uint64_t(idx) * uint64_t(HEAD_DIM) + uint64_t(lane * 2u)) * 4ul);
+        s_o_out.data[0] = o_s[r].x;
+        s_o_out.data[1] = o_s[r].y;
+    }
+}

@@ -1,0 +1,291 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Batched B=64 MoE Prefill Shader (3 modes, Wave64):
+// Reads EVERY active expert matrix AT MOST ONCE across all 64 tokens (3x less VRAM BW than 8x B=8)!
+// ExpertTable64 layout in groups_addr (49,664 bytes total):
+//   [0..127]:         u32 exp_count[128]
+//   [128..8319]:      u32 exp_tok[128 * 64]
+//   [8320..16511]:    u32 exp_slot[128 * 64]
+//   [16512..24703]:   f32 exp_rw[128 * 64]
+//
+// mode == 0: route_b64   (Grid=(1,1,1), Local=128) -> routes all 64 tokens + builds ExpertTable64
+// mode == 1: moe_up_b64  (Grid=(240,1,1), Local=256) -> persistent SwiGLU over all active experts x 144 tiles (4 tokens/pass)
+// mode == 2: moe_down_b64(Grid=(144,1,1), Local=256) -> zero-atomic LDS s_out[64][16] reduction across all active experts!
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t a0; // mode0: logits[64,128], mode1/2: w_addr
+    uint64_t a1; // mode0: bias[128],      mode1/2: s_addr
+    uint64_t a2; // mode0: groups_addr,    mode1/2: exp_sc_addr
+    uint64_t a3; // mode1: x_h[64,2304],   mode2: act_h[64,8,1152]
+    uint64_t a4; // mode1/2: groups_addr
+    uint64_t a5; // mode1: out_act_h,      mode2: out_down[64,2304]
+    uint mode;
+    uint n_lo;   // mode1/2: experts [0, n_lo) at a0/a1 (VRAM), rest at a6/a7 (DDR5, pre-biased)
+    uint64_t a6; // mode1/2: w_hi_addr
+    uint64_t a7; // mode1/2: s_hi_addr
+} pc;
+
+const uint B64 = 64u;
+const uint OFF_COUNT = 0u;
+const uint OFF_TOK   = 128u;
+const uint OFF_SLOT  = 128u + 128u * 64u;       // 8320
+const uint OFF_RW    = 128u + 2u * 128u * 64u;  // 16512
+
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+shared float s_out[64][16]; // 4096 B for moe_down_b64!
+shared float s_sg_max[2];
+shared int s_win_e;
+shared float s_win_sc;
+
+float dot16_h2(
+    f16vec2 wh0, f16vec2 wh1, f16vec2 wh2, f16vec2 wh3,
+    f16vec2 wh4, f16vec2 wh5, f16vec2 wh6, f16vec2 wh7,
+    F16Vec2Buf x_buf, uint xo
+) {
+    f16vec2 p0 = wh0 * x_buf.data[xo + 0u];
+    f16vec2 p1 = wh1 * x_buf.data[xo + 1u];
+    p0 = fma(wh2, x_buf.data[xo + 2u], p0);
+    p1 = fma(wh3, x_buf.data[xo + 3u], p1);
+    p0 = fma(wh4, x_buf.data[xo + 4u], p0);
+    p1 = fma(wh5, x_buf.data[xo + 5u], p1);
+    p0 = fma(wh6, x_buf.data[xo + 6u], p0);
+    p1 = fma(wh7, x_buf.data[xo + 7u], p1);
+    f16vec2 s2 = p0 + p1;
+    return float(s2.x) + float(s2.y);
+}
+
+void swiglu_store64(F16Buf out_act, uint b, uint k_slot, uint tile, uint row_in_wg, uint lane16, float v, float es) {
+    v += subgroupShuffleXor(v, 8u);
+    v += subgroupShuffleXor(v, 4u);
+    v += subgroupShuffleXor(v, 2u);
+    v += subgroupShuffleXor(v, 1u);
+    float scaled = v * es;
+    float up = subgroupShuffleXor(scaled, 16u);
+    if (lane16 == 0u && (row_in_wg & 1u) == 0u) {
+        uint p = row_in_wg >> 1u;
+        float g_cap = tanh(scaled * (1.0 / GATE_SOFTCAP)) * GATE_SOFTCAP;
+        float u_cap = tanh(up     * (1.0 / UP_SOFTCAP))   * UP_SOFTCAP;
+        float act = (g_cap * fast_sigmoid(scaled)) * u_cap;
+        out_act.data[(b * TOP_K + k_slot) * INTERMEDIATE + tile * 8u + p] = float16_t(act);
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    if (pc.mode == 0u) {
+        // route_b64: threads 0..127 own experts 0..127 (2 Wave64 subgroups)
+        U32Buf g_u32 = U32Buf(pc.a2);
+        F32Buf g_f32 = F32Buf(pc.a2);
+        F32Buf bias_buf = F32Buf(pc.a1);
+        float rb = (tid < 128u) ? bias_buf.data[tid] : -1e30;
+        uint sg = tid >> 6u;
+        uint my_cnt = 0u;
+
+        for (uint b = 0u; b < B64; ++b) {
+            F32Buf lg_buf = F32Buf(pc.a0 + uint64_t(b * NUM_EXPERTS) * 4ul);
+            float raw = (tid < 128u) ? fast_sigmoid(lg_buf.data[tid]) : 0.0;
+            float bi  = (tid < 128u) ? (raw + rb) : -1e30;
+            bool alive = (tid < 128u);
+            float chosen_sum = 0.0;
+            bool picked = false;
+            uint my_slot = 0u;
+
+            for (uint k = 0u; k < TOP_K; ++k) {
+                float cur = alive ? bi : -1e30;
+                float sm = subgroupMax(cur);
+                if (sg < 2u && subgroupElect()) s_sg_max[sg] = sm;
+                barrier();
+
+                float gmax = max(s_sg_max[0], s_sg_max[1]);
+                uint win_sg = (s_sg_max[0] >= s_sg_max[1]) ? 0u : 1u;
+                uvec4 bal = subgroupBallot(alive && (bi == gmax));
+                if (sg == win_sg) {
+                    uint win_lane = subgroupBallotFindLSB(bal);
+                    if ((tid & 63u) == win_lane) {
+                        s_win_e = int(tid);
+                        s_win_sc = raw;
+                        alive = false;
+                        picked = true;
+                        my_slot = k;
+                    }
+                }
+                barrier();
+                chosen_sum += s_win_sc;
+                barrier();
+            }
+
+            if (picked) {
+                float inv = ROUTE_SCALE / (chosen_sum + 1e-20);
+                uint idx = tid * B64 + my_cnt;
+                g_u32.data[OFF_TOK + idx] = b;
+                g_u32.data[OFF_SLOT + idx] = my_slot;
+                g_f32.data[OFF_RW + idx] = raw * inv;
+                my_cnt += 1u;
+            }
+        }
+        if (tid < 128u) g_u32.data[OFF_COUNT + tid] = my_cnt;
+        return;
+    }
+
+    s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
+    s_e4m3[tid] = decode_e4m3(tid);
+
+    uint row_in_wg = tid >> 4u;
+    uint lane16 = tid & 15u;
+
+    if (pc.mode == 1u) {
+        barrier();
+        U32Buf g_u32 = U32Buf(pc.a4);
+        F32Buf exp_sc = F32Buf(pc.a2);
+        F16Vec2Buf x_buf = F16Vec2Buf(pc.a3);
+        F16Buf out_act = F16Buf(pc.a5);
+
+        const uint N_TILES = INTERMEDIATE >> 3u; // 144
+        const uint R = 2u * INTERMEDIATE;
+        const uint N_BLK16 = HIDDEN >> 4u; // 144
+        const uint cols_h2 = HIDDEN >> 1u; // 1152
+
+        // Persistent loop over all 128 * 144 = 18,432 (expert, tile) tasks; empty experts exit in 1 cycle!
+        const uint total_tasks = NUM_EXPERTS * N_TILES;
+        for (uint task = gl_WorkGroupID.x; task < total_tasks; task += gl_NumWorkGroups.x) {
+            uint e = task / N_TILES;
+            uint cnt = g_u32.data[OFF_COUNT + e];
+            if (cnt == 0u) continue;
+            uint tile = task - e * N_TILES;
+            uint row = tile * 16u + row_in_wg;
+
+            uint64_t exp_row = uint64_t(e) * uint64_t(R) + uint64_t(row);
+            bool lo_tier = e < pc.n_lo;
+            Uvec2Buf w_buf = Uvec2Buf((lo_tier ? pc.a0 : pc.a6) + exp_row * uint64_t(N_BLK16) * 8ul);
+            U8Buf s_buf = U8Buf((lo_tier ? pc.a1 : pc.a7) + exp_row * uint64_t(N_BLK16));
+            float es = exp_sc.data[e];
+
+            // Process 4 tokens per weight-read pass (4x reuse of dequantized NVFP4 weights, 0 scratch spills!)
+            for (uint t0 = 0u; t0 < cnt; t0 += 4u) {
+                uint n4 = min(4u, cnt - t0);
+                uint b0 = g_u32.data[OFF_TOK + e * B64 + t0 + 0u];
+                uint b1 = (n4 >= 2u) ? g_u32.data[OFF_TOK + e * B64 + t0 + 1u] : 0u;
+                uint b2 = (n4 >= 3u) ? g_u32.data[OFF_TOK + e * B64 + t0 + 2u] : 0u;
+                uint b3 = (n4 >= 4u) ? g_u32.data[OFF_TOK + e * B64 + t0 + 3u] : 0u;
+
+                float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+                for (uint iter = 0u; iter < 9u; ++iter) {
+                    uint blk = lane16 + iter * 16u;
+                    uvec2 w8 = w_buf.data[blk];
+                    float sc = s_e4m3[uint(s_buf.data[blk])];
+
+                    f16vec2 wh0 = s_e2m1x2[w8.x & 0xFFu];
+                    f16vec2 wh1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu];
+                    f16vec2 wh2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu];
+                    f16vec2 wh3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu];
+                    f16vec2 wh4 = s_e2m1x2[w8.y & 0xFFu];
+                    f16vec2 wh5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu];
+                    f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
+                    f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
+
+                    uint xb = blk * 8u;
+                    a0 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, b0 * cols_h2 + xb), sc, a0);
+                    if (n4 >= 2u) a1 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, b1 * cols_h2 + xb), sc, a1);
+                    if (n4 >= 3u) a2 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, b2 * cols_h2 + xb), sc, a2);
+                    if (n4 >= 4u) a3 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, b3 * cols_h2 + xb), sc, a3);
+                }
+
+                swiglu_store64(out_act, b0, g_u32.data[OFF_SLOT + e * B64 + t0 + 0u], tile, row_in_wg, lane16, a0, es);
+                if (n4 >= 2u) swiglu_store64(out_act, b1, g_u32.data[OFF_SLOT + e * B64 + t0 + 1u], tile, row_in_wg, lane16, a1, es);
+                if (n4 >= 3u) swiglu_store64(out_act, b2, g_u32.data[OFF_SLOT + e * B64 + t0 + 2u], tile, row_in_wg, lane16, a2, es);
+                if (n4 >= 4u) swiglu_store64(out_act, b3, g_u32.data[OFF_SLOT + e * B64 + t0 + 3u], tile, row_in_wg, lane16, a3, es);
+            }
+        }
+        return;
+    }
+
+    // mode == 2: moe_down_b64 (Grid = (144, 1, 1), zero-atomic LDS s_out[64][16]!)
+    for (uint i = tid; i < 64u * 16u; i += 256u) {
+        s_out[i >> 4u][i & 15u] = 0.0;
+    }
+    barrier();
+
+    uint row = gl_WorkGroupID.x * 16u + row_in_wg;
+    if (row >= HIDDEN) return;
+
+    U32Buf g_u32 = U32Buf(pc.a4);
+    F32Buf g_f32 = F32Buf(pc.a4);
+    F32Buf exp_sc = F32Buf(pc.a2);
+    F16Vec2Buf act_buf = F16Vec2Buf(pc.a3);
+
+    const uint N_BLK16 = INTERMEDIATE >> 4u; // 72
+    const uint K_H2 = INTERMEDIATE >> 1u;    // 576
+
+    for (uint e = 0u; e < NUM_EXPERTS; ++e) {
+        uint cnt = g_u32.data[OFF_COUNT + e];
+        if (cnt == 0u) continue;
+        float es = exp_sc.data[e];
+        uint64_t exp_row = uint64_t(e) * uint64_t(HIDDEN) + uint64_t(row);
+        bool lo_tier = e < pc.n_lo;
+        Uvec2Buf w_buf = Uvec2Buf((lo_tier ? pc.a0 : pc.a6) + exp_row * uint64_t(N_BLK16) * 8ul);
+        U8Buf s_buf = U8Buf((lo_tier ? pc.a1 : pc.a7) + exp_row * uint64_t(N_BLK16));
+
+        for (uint t0 = 0u; t0 < cnt; t0 += 4u) {
+            uint n4 = min(4u, cnt - t0);
+            uint b0 = g_u32.data[OFF_TOK + e * B64 + t0 + 0u];
+            uint b1 = (n4 >= 2u) ? g_u32.data[OFF_TOK + e * B64 + t0 + 1u] : 0u;
+            uint b2 = (n4 >= 3u) ? g_u32.data[OFF_TOK + e * B64 + t0 + 2u] : 0u;
+            uint b3 = (n4 >= 4u) ? g_u32.data[OFF_TOK + e * B64 + t0 + 3u] : 0u;
+
+            uint s0 = (b0 * TOP_K + g_u32.data[OFF_SLOT + e * B64 + t0 + 0u]) * K_H2;
+            uint s1 = (n4 >= 2u) ? (b1 * TOP_K + g_u32.data[OFF_SLOT + e * B64 + t0 + 1u]) * K_H2 : 0u;
+            uint s2 = (n4 >= 3u) ? (b2 * TOP_K + g_u32.data[OFF_SLOT + e * B64 + t0 + 2u]) * K_H2 : 0u;
+            uint s3 = (n4 >= 4u) ? (b3 * TOP_K + g_u32.data[OFF_SLOT + e * B64 + t0 + 3u]) * K_H2 : 0u;
+
+            float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+            for (uint blk = lane16; blk < N_BLK16; blk += 16u) {
+                uvec2 w8 = w_buf.data[blk];
+                float sc = s_e4m3[uint(s_buf.data[blk])];
+
+                f16vec2 wh0 = s_e2m1x2[w8.x & 0xFFu];
+                f16vec2 wh1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu];
+                f16vec2 wh2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu];
+                f16vec2 wh3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu];
+                f16vec2 wh4 = s_e2m1x2[w8.y & 0xFFu];
+                f16vec2 wh5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu];
+                f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
+                f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
+
+                uint xb = blk * 8u;
+                a0 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, act_buf, s0 + xb), sc, a0);
+                if (n4 >= 2u) a1 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, act_buf, s1 + xb), sc, a1);
+                if (n4 >= 3u) a2 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, act_buf, s2 + xb), sc, a2);
+                if (n4 >= 4u) a3 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, act_buf, s3 + xb), sc, a3);
+            }
+
+            a0 += subgroupShuffleXor(a0, 8u); a0 += subgroupShuffleXor(a0, 4u); a0 += subgroupShuffleXor(a0, 2u); a0 += subgroupShuffleXor(a0, 1u);
+            if (lane16 == 0u) s_out[b0][row_in_wg] += a0 * es * g_f32.data[OFF_RW + e * B64 + t0 + 0u];
+            if (n4 >= 2u) {
+                a1 += subgroupShuffleXor(a1, 8u); a1 += subgroupShuffleXor(a1, 4u); a1 += subgroupShuffleXor(a1, 2u); a1 += subgroupShuffleXor(a1, 1u);
+                if (lane16 == 0u) s_out[b1][row_in_wg] += a1 * es * g_f32.data[OFF_RW + e * B64 + t0 + 1u];
+            }
+            if (n4 >= 3u) {
+                a2 += subgroupShuffleXor(a2, 8u); a2 += subgroupShuffleXor(a2, 4u); a2 += subgroupShuffleXor(a2, 2u); a2 += subgroupShuffleXor(a2, 1u);
+                if (lane16 == 0u) s_out[b2][row_in_wg] += a2 * es * g_f32.data[OFF_RW + e * B64 + t0 + 2u];
+            }
+            if (n4 >= 4u) {
+                a3 += subgroupShuffleXor(a3, 8u); a3 += subgroupShuffleXor(a3, 4u); a3 += subgroupShuffleXor(a3, 2u); a3 += subgroupShuffleXor(a3, 1u);
+                if (lane16 == 0u) s_out[b3][row_in_wg] += a3 * es * g_f32.data[OFF_RW + e * B64 + t0 + 3u];
+            }
+        }
+    }
+    barrier();
+
+    F32Buf out_d = F32Buf(pc.a5);
+    for (uint i = tid; i < 64u * 16u; i += 256u) {
+        uint b = i >> 4u;
+        uint r = i & 15u;
+        out_d.data[b * HIDDEN + gl_WorkGroupID.x * 16u + r] = s_out[b][r];
+    }
+}

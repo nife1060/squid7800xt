@@ -1,0 +1,78 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// DSpark weight preparation shader (3 modes):
+// mode == 0: split rnn_proj [768, 5120] -> w_sp [768, 512], w_h [768, 2304], w_f [768, 2304]
+// mode == 1: compute fold_b[v] = dot(unembed[v, :], hidden_out_b[:]) (V workgroups/8 rows per WG)
+// mode == 2: compute fold_w[v, r] = dot(unembed[v, :], hidden_out_w[:, r]) -> BF16 [V, 256]
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t addr0; // mode0: src, mode1/2: unembed_bf16
+    uint64_t addr1; // mode0: w_sp, mode1: hidden_out_b, mode2: hidden_out_w
+    uint64_t addr2; // mode0: w_h,  mode1: fold_b,       mode2: fold_w_bf16
+    uint64_t addr3; // mode0: w_f
+    uint V;
+    uint mode;
+} pc;
+
+shared float s_urow[HIDDEN];
+shared float s_red[8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (pc.mode == 0u) {
+        uint o = gl_WorkGroupID.x;
+        const uint K_IN = 512u + 2u * HIDDEN;
+        U16Buf src = U16Buf(pc.addr0 + uint64_t(o) * uint64_t(K_IN) * 2ul);
+        U16Buf w_sp = U16Buf(pc.addr1 + uint64_t(o) * 512ul * 2ul);
+        U16Buf w_h  = U16Buf(pc.addr2 + uint64_t(o) * uint64_t(HIDDEN) * 2ul);
+        U16Buf w_f  = U16Buf(pc.addr3 + uint64_t(o) * uint64_t(HIDDEN) * 2ul);
+        for (uint c = tid; c < K_IN; c += 256u) {
+            uint16_t v = src.data[c];
+            if (c < 512u) w_sp.data[c] = v;
+            else if (c < 512u + HIDDEN) w_h.data[c - 512u] = v;
+            else w_f.data[c - 512u - HIDDEN] = v;
+        }
+        return;
+    }
+
+    if (pc.mode == 1u) {
+        uint v = gl_WorkGroupID.x;
+        if (v >= pc.V) return;
+        U16Buf urow = U16Buf(pc.addr0 + uint64_t(v) * uint64_t(HIDDEN) * 2ul);
+        U16Buf hb = U16Buf(pc.addr1);
+        float acc = 0.0;
+        for (uint k = tid; k < HIDDEN; k += 256u) {
+            acc = fma(bf16_to_f32(urow.data[k]), bf16_to_f32(hb.data[k]), acc);
+        }
+        float sg = subgroupAdd(acc);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sg;
+        barrier();
+        if (tid == 0u) {
+            float tot = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) tot += s_red[s];
+            F32Buf fb = F32Buf(pc.addr2);
+            fb.data[v] = tot;
+        }
+        return;
+    }
+
+    // mode == 2: fold_w[v, r]
+    uint v = gl_WorkGroupID.x;
+    if (v >= pc.V) return;
+    U16Buf urow = U16Buf(pc.addr0 + uint64_t(v) * uint64_t(HIDDEN) * 2ul);
+    for (uint k = tid; k < HIDDEN; k += 256u) {
+        s_urow[k] = bf16_to_f32(urow.data[k]);
+    }
+    barrier();
+    U16Buf hw = U16Buf(pc.addr1);
+    float acc = 0.0;
+    for (uint k = 0u; k < HIDDEN; ++k) {
+        acc = fma(s_urow[k], bf16_to_f32(hw.data[k * MTP_MARKOV_RANK + tid]), acc);
+    }
+    U16Buf fout = U16Buf(pc.addr2 + uint64_t(v) * uint64_t(MTP_MARKOV_RANK) * 2ul);
+    fout.data[tid] = f32_to_bf16(acc);
+}

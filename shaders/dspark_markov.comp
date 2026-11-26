@@ -1,0 +1,269 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// DSpark Markov Head Shader (4 modes, Wave64):
+// mode == 0: bf16_linear (Y[B, N] = X[B, K] @ W[N, K]^T) -> Grid=((N+15)/16, 1, 1), Local=256 (16 lanes/row)
+// mode == 1: markov_rnn_proj (raw[768] = bias + c_h + c_f + rnn_w_sp @ [state; markov_w1[prev]]) -> Grid=(48,1,1), Local=256 (16 rows/WG)
+// mode == 2: markov_fold_argmax_stage1 (128 persistent WGs over Vd) -> updates state[256] + computes partial max & softmax (cm, csum)!
+// mode == 3: markov_fold_argmax_stage2 (Grid=(1,1,1), Local=256) -> reduces 128 partials -> out_tok (remapped via draft_vocab_ids) + out_conf!
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t a0;
+    uint64_t a1;
+    uint64_t a2;
+    uint64_t a3;
+    uint64_t a4;
+    uint64_t a5;
+    uint64_t a6;
+    uint64_t a7;
+    uint64_t a8;
+    uint64_t a9;
+    uint64_t a10;
+    uint p0;      // mode0: N, mode2/3: Vd
+    uint p1;      // mode0: K
+    uint p2;      // mode0: B
+    float gscale; // mode2: fold_w.global_scale
+    uint mode;
+} pc;
+
+const uint MARKOV_BLOCKS = 128u;
+
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+shared float s_sp[512];
+shared float16_t s_lh[256];
+shared float s_mv[16];
+shared int s_mi[16];
+shared float s_cm[16];
+shared float s_cs[16];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    if (pc.mode == 0u) {
+        // bf16_linear: a0=W_bf16[N,K], a1=X_f32[B,K], a2=Y_f32[B,N]
+        uint row_in_wg = tid >> 4u;
+        uint lane16 = tid & 15u;
+        uint row = gl_WorkGroupID.x * 16u + row_in_wg;
+        if (row >= pc.p0) return;
+
+        U16Buf wr = U16Buf(pc.a0 + uint64_t(row) * uint64_t(pc.p1) * 2ul);
+        F32Buf xb = F32Buf(pc.a1);
+        F32Buf yb = F32Buf(pc.a2);
+
+        float acc[8];
+        for (uint b = 0u; b < 8u; ++b) acc[b] = 0.0;
+        for (uint k = lane16; k < pc.p1; k += 16u) {
+            float wv = bf16_to_f32(wr.data[k]);
+            for (uint b = 0u; b < pc.p2; ++b) {
+                acc[b] = fma(wv, xb.data[b * pc.p1 + k], acc[b]);
+            }
+        }
+        for (uint b = 0u; b < pc.p2; ++b) {
+            float v = acc[b];
+            v += subgroupShuffleXor(v, 8u);
+            v += subgroupShuffleXor(v, 4u);
+            v += subgroupShuffleXor(v, 2u);
+            v += subgroupShuffleXor(v, 1u);
+            if (lane16 == 0u) yb.data[b * pc.p0 + row] = v;
+        }
+        return;
+    }
+
+    if (pc.mode == 1u) {
+        // markov_rnn_proj: a0=rnn_w_sp[768,512], a1=rnn_bias[768], a2=markov_w1[201024,256],
+        //                  a3=c_h_i[768], a4=c_f[768], a5=prev_tok[1], a6=state[256], a7=out_raw[768]
+        I32Buf pt = I32Buf(pc.a5);
+        int prev_tok = pt.data[0];
+        F32Buf st = F32Buf(pc.a6);
+        U16Buf w1r = U16Buf(pc.a2 + uint64_t(uint(prev_tok)) * uint64_t(MTP_MARKOV_RANK) * 2ul);
+        s_sp[tid] = st.data[tid];
+        s_sp[256u + tid] = bf16_to_f32(w1r.data[tid]);
+        barrier();
+
+        uint row_in_wg = tid >> 4u;
+        uint lane16 = tid & 15u;
+        uint r = gl_WorkGroupID.x * 16u + row_in_wg;
+        if (r >= 768u) return;
+
+        U16Buf wr = U16Buf(pc.a0 + uint64_t(r) * 512ul * 2ul);
+        float acc = 0.0;
+        for (uint k = lane16; k < 512u; k += 16u) {
+            acc = fma(bf16_to_f32(wr.data[k]), s_sp[k], acc);
+        }
+        acc += subgroupShuffleXor(acc, 8u);
+        acc += subgroupShuffleXor(acc, 4u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 1u);
+        if (lane16 == 0u) {
+            U16Buf rb = U16Buf(pc.a1);
+            F32Buf ch = F32Buf(pc.a3);
+            F32Buf cf = F32Buf(pc.a4);
+            F32Buf out_r = F32Buf(pc.a7);
+            out_r.data[r] = acc + bf16_to_f32(rb.data[r]) + ch.data[r] + cf.data[r];
+        }
+        return;
+    }
+
+    if (pc.mode == 2u) {
+        // markov_fold_argmax_stage1:
+        // a0=fold_w_data, a1=fold_w_scales, a2=base_logits_i[Vd], a3=fold_b[Vd],
+        // a4=raw_rnn[768], a5=state[256], a6=blk_val, a7=blk_idx, a8=blk_cm, a9=blk_csum
+        s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
+        s_e4m3[tid] = decode_e4m3(tid);
+
+        F32Buf rr = F32Buf(pc.a4);
+        s_lh[tid] = float16_t(tanh(rr.data[512u + tid]));
+        if (gl_WorkGroupID.x == 0u) {
+            F32Buf st = F32Buf(pc.a5);
+            float g = fast_sigmoid(rr.data[tid]);
+            float c = tanh(rr.data[256u + tid]);
+            st.data[tid] = g * st.data[tid] + (1.0 - g) * c;
+        }
+        barrier();
+
+        uint row_in_wg = tid >> 4u;
+        uint lane16 = tid & 15u;
+        uint start_r = gl_WorkGroupID.x * 16u + row_in_wg;
+        uint stride_r = MARKOV_BLOCKS * 16u;
+
+        F32Buf bl = F32Buf(pc.a2);
+        F32Buf fb = F32Buf(pc.a3);
+
+        float bv = -1e30;
+        int bi = 0;
+        float cm = -1e30;
+        float csum = 0.0;
+
+        uint x_base = lane16 * 16u;
+        f16vec2 x0 = f16vec2(s_lh[x_base + 0u],  s_lh[x_base + 1u]);
+        f16vec2 x1 = f16vec2(s_lh[x_base + 2u],  s_lh[x_base + 3u]);
+        f16vec2 x2 = f16vec2(s_lh[x_base + 4u],  s_lh[x_base + 5u]);
+        f16vec2 x3 = f16vec2(s_lh[x_base + 6u],  s_lh[x_base + 7u]);
+        f16vec2 x4 = f16vec2(s_lh[x_base + 8u],  s_lh[x_base + 9u]);
+        f16vec2 x5 = f16vec2(s_lh[x_base + 10u], s_lh[x_base + 11u]);
+        f16vec2 x6 = f16vec2(s_lh[x_base + 12u], s_lh[x_base + 13u]);
+        f16vec2 x7 = f16vec2(s_lh[x_base + 14u], s_lh[x_base + 15u]);
+
+        for (uint row = start_r; row < pc.p0; row += stride_r) {
+            // K = 256 -> 16 blocks of 16 -> 1 EXACT block per lane16!
+            Uvec2Buf wr = Uvec2Buf(pc.a0 + uint64_t(row) * 128ul);
+            U8Buf sr = U8Buf(pc.a1 + uint64_t(row) * 16ul);
+            uvec2 w8 = wr.data[lane16];
+            float sc = s_e4m3[uint(sr.data[lane16])];
+
+            f16vec2 p0 = s_e2m1x2[w8.x & 0xFFu] * x0;
+            f16vec2 p1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu] * x1;
+            p0 = fma(s_e2m1x2[(w8.x >> 16u) & 0xFFu], x2, p0);
+            p1 = fma(s_e2m1x2[(w8.x >> 24u) & 0xFFu], x3, p1);
+            p0 = fma(s_e2m1x2[w8.y & 0xFFu], x4, p0);
+            p1 = fma(s_e2m1x2[(w8.y >> 8u) & 0xFFu], x5, p1);
+            p0 = fma(s_e2m1x2[(w8.y >> 16u) & 0xFFu], x6, p0);
+            p1 = fma(s_e2m1x2[(w8.y >> 24u) & 0xFFu], x7, p1);
+            f16vec2 s2 = p0 + p1;
+            float acc = (float(s2.x) + float(s2.y)) * sc;
+
+            acc += subgroupShuffleXor(acc, 8u);
+            acc += subgroupShuffleXor(acc, 4u);
+            acc += subgroupShuffleXor(acc, 2u);
+            acc += subgroupShuffleXor(acc, 1u);
+
+            if (lane16 == 0u) {
+                float total = bl.data[row] + fb.data[row] + acc * pc.gscale;
+                if (total > bv || (total == bv && int(row) < bi)) { bv = total; bi = int(row); }
+                float cap = tanh(total * (1.0 / FINAL_SOFTCAP)) * FINAL_SOFTCAP;
+                if (cap > cm) {
+                    csum = (csum > 0.0) ? (csum * exp(cm - cap) + 1.0) : 1.0;
+                    cm = cap;
+                } else {
+                    csum += exp(cap - cm);
+                }
+            }
+        }
+
+        if (lane16 == 0u) {
+            s_mv[row_in_wg] = bv;
+            s_mi[row_in_wg] = bi;
+            s_cm[row_in_wg] = cm;
+            s_cs[row_in_wg] = csum;
+        }
+        barrier();
+
+        if (tid == 0u) {
+            bv = s_mv[0]; bi = s_mi[0]; cm = s_cm[0]; csum = s_cs[0];
+            for (uint w = 1u; w < 16u; ++w) {
+                if (s_mv[w] > bv || (s_mv[w] == bv && s_mi[w] < bi)) { bv = s_mv[w]; bi = s_mi[w]; }
+                if (s_cs[w] > 0.0) {
+                    float nm = max(cm, s_cm[w]);
+                    csum = (csum > 0.0 ? csum * exp(cm - nm) : 0.0) + s_cs[w] * exp(s_cm[w] - nm);
+                    cm = nm;
+                }
+            }
+            F32Buf bval = F32Buf(pc.a6);
+            I32Buf bidx = I32Buf(pc.a7);
+            F32Buf bcm = F32Buf(pc.a8);
+            F32Buf bcs = F32Buf(pc.a9);
+            bval.data[gl_WorkGroupID.x] = bv;
+            bidx.data[gl_WorkGroupID.x] = bi;
+            bcm.data[gl_WorkGroupID.x] = cm;
+            bcs.data[gl_WorkGroupID.x] = csum;
+        }
+        return;
+    }
+
+    // mode == 3: markov_fold_argmax_stage2
+    // a0=blk_val, a1=blk_idx, a2=blk_cm, a3=blk_csum, a4=draft_vocab_ids (opt), a5=out_tok[1], a6=out_conf[1]
+    F32Buf bval = F32Buf(pc.a0);
+    I32Buf bidx = I32Buf(pc.a1);
+    F32Buf bcm = F32Buf(pc.a2);
+    F32Buf bcs = F32Buf(pc.a3);
+
+    float bv = (tid < MARKOV_BLOCKS) ? bval.data[tid] : -1e30;
+    int bi = (tid < MARKOV_BLOCKS) ? bidx.data[tid] : 0;
+    float cm = (tid < MARKOV_BLOCKS) ? bcm.data[tid] : -1e30;
+    float csum = (tid < MARKOV_BLOCKS) ? bcs.data[tid] : 0.0;
+
+    for (uint off = 32u; off > 0u; off >>= 1u) {
+        float ov = subgroupShuffleXor(bv, off);
+        int oi = subgroupShuffleXor(bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        float om = subgroupShuffleXor(cm, off);
+        float os = subgroupShuffleXor(csum, off);
+        if (os > 0.0) {
+            float nm = max(cm, om);
+            csum = (csum > 0.0 ? csum * exp(cm - nm) : 0.0) + os * exp(om - nm);
+            cm = nm;
+        }
+    }
+    if ((tid & 63u) == 0u) {
+        uint sg = tid >> 6u;
+        s_mv[sg] = bv; s_mi[sg] = bi; s_cm[sg] = cm; s_cs[sg] = csum;
+    }
+    barrier();
+
+    if (tid == 0u) {
+        bv = s_mv[0]; bi = s_mi[0]; cm = s_cm[0]; csum = s_cs[0];
+        for (uint w = 1u; w < 4u; ++w) {
+            if (s_mv[w] > bv || (s_mv[w] == bv && s_mi[w] < bi)) { bv = s_mv[w]; bi = s_mi[w]; }
+            if (s_cs[w] > 0.0) {
+                float nm = max(cm, s_cm[w]);
+                csum = (csum > 0.0 ? csum * exp(cm - nm) : 0.0) + s_cs[w] * exp(s_cm[w] - nm);
+                cm = nm;
+            }
+        }
+        int real_tok = bi;
+        if (pc.a4 != 0ul) {
+            I32Buf dv_ids = I32Buf(pc.a4);
+            real_tok = dv_ids.data[bi];
+        }
+        I32Buf out_t = I32Buf(pc.a5);
+        out_t.data[0] = real_tok;
+        if (pc.a6 != 0ul) {
+            F32Buf out_c = F32Buf(pc.a6);
+            out_c.data[0] = (csum > 0.0) ? (1.0 / csum) : 0.0;
+        }
+    }
+}

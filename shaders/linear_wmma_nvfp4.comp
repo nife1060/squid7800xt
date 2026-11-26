@@ -1,0 +1,175 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_cooperative_matrix : require
+
+// RDNA 3 WMMA (VK_KHR_cooperative_matrix, 16x16x16 FP16->FP32, Wave32) NVFP4 Batched Prefill GEMM!
+// Computes Y[B=64, N] = X_h[B=64, K] @ W_nvfp4[N, K]^T * global_scale
+// Grid: ((N + 63) / 64, 1, 1), Local: 128 threads (4 Wave32 subgroups, 64x64 output tile per WG!).
+// Total LDS: 4608 + 4608 + 4096 + 1024 + 1024 = 15,360 B (< 16 KiB -> full occupancy!).
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer U8Buf { uint8_t data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer F16Buf { float16_t data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer F32Buf { float data[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Uvec2Buf { uvec2 data[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t s_addr;
+    uint64_t x_h_addr; // [64, K] FP16
+    uint64_t y_addr;   // [64, N] F32
+    uint N;            // output rows (any multiple of 1, bounds checked!)
+    uint K;            // input cols (multiple of 32)
+    float global_scale;
+    uint add_residual;
+} pc;
+
+const float16_t E2M1_LUT[16] = float16_t[16](
+    float16_t( 0.0), float16_t( 0.5), float16_t( 1.0), float16_t( 1.5),
+    float16_t( 2.0), float16_t( 3.0), float16_t( 4.0), float16_t( 6.0),
+    float16_t(-0.0), float16_t(-0.5), float16_t(-1.0), float16_t(-1.5),
+    float16_t(-2.0), float16_t(-3.0), float16_t(-4.0), float16_t(-6.0)
+);
+
+float decode_e4m3(uint b) {
+    uint sign = (b >> 7u) & 1u;
+    uint exp  = (b >> 3u) & 0xFu;
+    uint man  = b & 7u;
+    float val;
+    if (exp == 0u) {
+        val = float(man) * (1.0 / 512.0);
+    } else if (exp == 15u && man == 7u) {
+        val = 0.0;
+    } else {
+        val = (1.0 + float(man) * 0.125) * exp2(float(int(exp) - 7));
+    }
+    return (sign != 0u) ? -val : val;
+}
+
+shared float16_t smA[64 * 36];
+shared float16_t smB[64 * 36];
+shared float smC[4 * 256];
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint wave_id = tid >> 5u;
+    uint lane = tid & 31u;
+    uint wy = wave_id >> 1u; // 0..1 (rows 0..31 or 32..63 of B=64)
+    uint wx = wave_id & 1u;  // 0..1 (cols 0..31 or 32..63 of N tile)
+
+    // Initialize 256-entry LUTs (2 entries per thread across 128 threads)
+    for (uint i = tid; i < 256u; i += 128u) {
+        s_e2m1x2[i] = f16vec2(E2M1_LUT[i & 0xFu], E2M1_LUT[(i >> 4u) & 0xFu]);
+        s_e4m3[i] = decode_e4m3(i);
+    }
+    barrier();
+
+    uint n0 = gl_WorkGroupID.x * 64u;
+    uint n_blocks16 = pc.K >> 4u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2][2];
+    acc[0][0] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    acc[0][1] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    acc[1][0] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    acc[1][1] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint w_row = tid >> 1u;      // 0..63
+    uint w_b2  = tid & 1u;       // 0..1 (which block16 inside 32-col slice)
+    uint g_n   = n0 + w_row;
+    bool n_ok  = (g_n < pc.N);
+    Uvec2Buf w_buf = Uvec2Buf(pc.w_addr + uint64_t(g_n) * uint64_t(n_blocks16) * 8ul);
+    U8Buf s_buf = U8Buf(pc.s_addr + uint64_t(g_n) * uint64_t(n_blocks16));
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += 32u) {
+        // 1. Load 64x32 tile of X_h into smA
+        for (uint idx = tid; idx < 512u; idx += 128u) {
+            uint r = idx >> 3u;
+            uint c4 = (idx & 7u) * 4u;
+            F16Buf Xrow = F16Buf(pc.x_h_addr + (uint64_t(r) * uint64_t(pc.K) + uint64_t(k0 + c4)) * 2ul);
+            uint base = r * 36u + c4;
+            smA[base + 0u] = Xrow.data[0u];
+            smA[base + 1u] = Xrow.data[1u];
+            smA[base + 2u] = Xrow.data[2u];
+            smA[base + 3u] = Xrow.data[3u];
+        }
+
+        // 2. Load & dequantize 64x32 NVFP4 weight tile into smB (EXACTLY 1 block16 per thread!)
+        uint bbase = w_row * 36u + w_b2 * 16u;
+        if (n_ok) {
+            uint blk = (k0 >> 4u) + w_b2;
+            uvec2 w8 = w_buf.data[blk];
+            float16_t sc = float16_t(s_e4m3[uint(s_buf.data[blk])]);
+            f16vec2 v0 = s_e2m1x2[w8.x & 0xFFu] * sc;
+            f16vec2 v1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu] * sc;
+            f16vec2 v2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu] * sc;
+            f16vec2 v3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu] * sc;
+            f16vec2 v4 = s_e2m1x2[w8.y & 0xFFu] * sc;
+            f16vec2 v5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu] * sc;
+            f16vec2 v6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu] * sc;
+            f16vec2 v7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu] * sc;
+            smB[bbase + 0u]  = v0.x; smB[bbase + 1u]  = v0.y;
+            smB[bbase + 2u]  = v1.x; smB[bbase + 3u]  = v1.y;
+            smB[bbase + 4u]  = v2.x; smB[bbase + 5u]  = v2.y;
+            smB[bbase + 6u]  = v3.x; smB[bbase + 7u]  = v3.y;
+            smB[bbase + 8u]  = v4.x; smB[bbase + 9u]  = v4.y;
+            smB[bbase + 10u] = v5.x; smB[bbase + 11u] = v5.y;
+            smB[bbase + 12u] = v6.x; smB[bbase + 13u] = v6.y;
+            smB[bbase + 14u] = v7.x; smB[bbase + 15u] = v7.y;
+        } else {
+            for (uint i = 0u; i < 16u; ++i) smB[bbase + i] = float16_t(0.0);
+        }
+        barrier();
+
+        // 3. 2x K-steps of 16x16x16 RDNA 3 WMMA!
+        for (uint ks = 0u; ks < 32u; ks += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA[2];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB[2];
+            coopMatLoad(matA[0], smA, (wy * 32u + 0u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matA[1], smA, (wy * 32u + 16u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matB[0], smB, (wx * 32u + 0u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(matB[1], smB, (wx * 32u + 16u) * 36u + ks, 36u, gl_CooperativeMatrixLayoutColumnMajor);
+
+            acc[0][0] = coopMatMulAdd(matA[0], matB[0], acc[0][0]);
+            acc[0][1] = coopMatMulAdd(matA[0], matB[1], acc[0][1]);
+            acc[1][0] = coopMatMulAdd(matA[1], matB[0], acc[1][0]);
+            acc[1][1] = coopMatMulAdd(matA[1], matB[1], acc[1][1]);
+        }
+        barrier();
+    }
+
+    // 4. Bounds-checked scaled epilogue via per-wave smC[wave_id * 256]
+    F32Buf y_buf = F32Buf(pc.y_addr);
+    uint c_off = wave_id * 256u;
+    for (uint i = 0u; i < 2u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            coopMatStore(acc[i][j], smC, c_off, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            uint row_base = wy * 32u + i * 16u;
+            uint col_base = n0 + wx * 32u + j * 16u;
+            for (uint e = lane; e < 256u; e += 32u) {
+                uint r = e >> 4u;
+                uint c = e & 15u;
+                uint g_col = col_base + c;
+                if (g_col < pc.N) {
+                    float val = smC[c_off + e] * pc.global_scale;
+                    uint yidx = (row_base + r) * pc.N + g_col;
+                    if (pc.add_residual != 0u) y_buf.data[yidx] += val;
+                    else y_buf.data[yidx] = val;
+                }
+            }
+            subgroupMemoryBarrierShared();
+        }
+    }
+}

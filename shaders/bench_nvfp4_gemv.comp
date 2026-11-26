@@ -1,0 +1,136 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+// Benchmark NVFP4 (E2M1 packed + FP8 E4M3 block-16 scales) GEMV on RX 7800 XT!
+// Wave32 (or Wave64): each subgroup computes 1 output row (or 2 rows with half-subgroup).
+// Local size = 256 threads -> 8 rows per workgroup (Wave32) or 4 rows (Wave64).
+// Mode 0: constant LUT[16] decode; Mode 1: LDS 256-entry f16vec2 LUT decode.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer Uvec2Buf {
+    uvec2 data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer UintBuf {
+    uint data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer U8Buf {
+    uint8_t data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer F16Vec2Buf {
+    f16vec2 data[];
+};
+layout(buffer_reference, scalar, buffer_reference_align = 4) writeonly buffer F32Buf {
+    float data[];
+};
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t s_addr;
+    uint64_t x_addr;
+    uint64_t y_addr;
+    uint rows;
+    uint cols; // multiple of 16, e.g. 2304 -> 144 blocks of 16
+    float global_scale;
+    uint mode; // 0 = reg LUT16, 1 = LDS LUT256
+} pc;
+
+const float16_t E2M1_LUT[16] = float16_t[16](
+    float16_t(0.0),  float16_t(0.5),  float16_t(1.0),  float16_t(1.5),
+    float16_t(2.0),  float16_t(3.0),  float16_t(4.0),  float16_t(6.0),
+    float16_t(-0.0), float16_t(-0.5), float16_t(-1.0), float16_t(-1.5),
+    float16_t(-2.0), float16_t(-3.0), float16_t(-4.0), float16_t(-6.0)
+);
+
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+
+float decode_e4m3_init(uint code) {
+    uint sign = (code >> 7u) & 1u;
+    uint exp = (code >> 3u) & 0xFu;
+    uint man = code & 0x7u;
+    float val;
+    if (exp == 0u) {
+        val = float(man) * (1.0 / 512.0); // 2^-6 * man / 8
+    } else if (exp == 15u && man == 7u) {
+        val = 0.0;
+    } else {
+        uint f32_bits = ((exp + 120u) << 23u) | (man << 20u);
+        val = uintBitsToFloat(f32_bits);
+    }
+    return (sign != 0u) ? -val : val;
+}
+
+f16vec2 unpack_e2m1_reg(uint byte_val) {
+    return f16vec2(E2M1_LUT[byte_val & 0xFu], E2M1_LUT[(byte_val >> 4u) & 0xFu]);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    // Populate 256-entry E2M1x2 and E4M3 LUTs in LDS (1 thread per entry = 1 cycle!)
+    s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
+    s_e4m3[tid] = decode_e4m3_init(tid);
+    barrier();
+
+    // Half-subgroup per row if subgroupSize == 64 (32 lanes/row), or full subgroup if 32 (32 lanes/row).
+    // Here: 16 lanes per row! 256 / 16 = 16 rows per workgroup (matches squid5090 half-warp lm_head!).
+    uint row_in_wg = tid >> 4u;
+    uint lane16 = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + row_in_wg;
+    if (row >= pc.rows) return;
+
+    uint n_blocks16 = pc.cols >> 4u; // 2304 / 16 = 144 blocks of 16 elements (8 bytes each)
+    Uvec2Buf w_buf = Uvec2Buf(pc.w_addr + uint64_t(row) * uint64_t(n_blocks16) * 8ul);
+    U8Buf s_buf = U8Buf(pc.s_addr + uint64_t(row) * uint64_t(n_blocks16));
+    F16Vec2Buf x_buf = F16Vec2Buf(pc.x_addr);
+
+    float acc = 0.0;
+    for (uint blk = lane16; blk < n_blocks16; blk += 16u) {
+        uvec2 w8 = w_buf.data[blk];
+        float sc = s_e4m3[uint(s_buf.data[blk])];
+        uint x_off = blk * 8u;
+
+        f16vec2 p0, p1;
+        if (pc.mode == 1u) {
+            p0 = s_e2m1x2[w8.x & 0xFFu] * x_buf.data[x_off + 0u];
+            p1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu] * x_buf.data[x_off + 1u];
+            p0 = fma(s_e2m1x2[(w8.x >> 16u) & 0xFFu], x_buf.data[x_off + 2u], p0);
+            p1 = fma(s_e2m1x2[(w8.x >> 24u) & 0xFFu], x_buf.data[x_off + 3u], p1);
+            p0 = fma(s_e2m1x2[w8.y & 0xFFu], x_buf.data[x_off + 4u], p0);
+            p1 = fma(s_e2m1x2[(w8.y >> 8u) & 0xFFu], x_buf.data[x_off + 5u], p1);
+            p0 = fma(s_e2m1x2[(w8.y >> 16u) & 0xFFu], x_buf.data[x_off + 6u], p0);
+            p1 = fma(s_e2m1x2[(w8.y >> 24u) & 0xFFu], x_buf.data[x_off + 7u], p1);
+        } else {
+            p0 = unpack_e2m1_reg(w8.x & 0xFFu) * x_buf.data[x_off + 0u];
+            p1 = unpack_e2m1_reg((w8.x >> 8u) & 0xFFu) * x_buf.data[x_off + 1u];
+            p0 = fma(unpack_e2m1_reg((w8.x >> 16u) & 0xFFu), x_buf.data[x_off + 2u], p0);
+            p1 = fma(unpack_e2m1_reg((w8.x >> 24u) & 0xFFu), x_buf.data[x_off + 3u], p1);
+            p0 = fma(unpack_e2m1_reg(w8.y & 0xFFu), x_buf.data[x_off + 4u], p0);
+            p1 = fma(unpack_e2m1_reg((w8.y >> 8u) & 0xFFu), x_buf.data[x_off + 5u], p1);
+            p0 = fma(unpack_e2m1_reg((w8.y >> 16u) & 0xFFu), x_buf.data[x_off + 6u], p0);
+            p1 = fma(unpack_e2m1_reg((w8.y >> 24u) & 0xFFu), x_buf.data[x_off + 7u], p1);
+        }
+        f16vec2 sum2 = p0 + p1;
+        acc = fma(float(sum2.x) + float(sum2.y), sc, acc);
+    }
+
+    // 16-lane butterfly reduction
+    acc += subgroupShuffleXor(acc, 8u);
+    acc += subgroupShuffleXor(acc, 4u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 1u);
+
+    if (lane16 == 0u) {
+        F32Buf y_buf = F32Buf(pc.y_addr);
+        y_buf.data[row] = acc * pc.global_scale;
+    }
+}

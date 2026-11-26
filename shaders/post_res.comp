@@ -1,0 +1,68 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Fused Post-Projection Static 4-Tap Short Conv (16-slot ring) + Residual Add
+// + optional Block-Boundary copy (blocks[b, block_idx] = partial[b])
+// + optional Tap copy (tap_out[b] = hidden_out[b]).
+// Grid: ((HIDDEN + 255) / 256 = 9, 1, 1), Local: 256 threads.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t src_addr;         // [B, HIDDEN] (o_proj or moe_down)
+    uint64_t sconv_w_addr;     // [HIDDEN, 4] BF16
+    uint64_t ring_addr;        // [16, HIDDEN] F32
+    uint64_t residual_addr;    // [B, HIDDEN] F32
+    uint64_t out_addr;         // [B, HIDDEN] F32
+    uint64_t blocks_addr;      // optional [B, 4, HIDDEN]
+    uint64_t partial_addr;     // optional [B, HIDDEN]
+    uint64_t tap_out_addr;     // optional [B, HIDDEN]
+    uint64_t d_pos_addr;       // [1] I32
+    uint B;
+    uint block_idx;            // valid if blocks_addr != 0
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= HIDDEN) return;
+
+    I32Buf pos_buf = I32Buf(pc.d_pos_addr);
+    int pos0 = pos_buf.data[0];
+
+    Uvec2Buf sw_all = Uvec2Buf(pc.sconv_w_addr);
+    uvec2 sw2 = sw_all.data[c];
+    float w0 = uintBitsToFloat((sw2.x & 0xFFFFu) << 16u);
+    float w1 = uintBitsToFloat(sw2.x & 0xFFFF0000u);
+    float w2 = uintBitsToFloat((sw2.y & 0xFFFFu) << 16u);
+    float w3 = uintBitsToFloat(sw2.y & 0xFFFF0000u);
+
+    F32Buf ring = F32Buf(pc.ring_addr);
+    float h0 = (pos0 >= 3) ? ring.data[uint((pos0 - 3) & 15) * HIDDEN + c] : 0.0;
+    float h1 = (pos0 >= 2) ? ring.data[uint((pos0 - 2) & 15) * HIDDEN + c] : 0.0;
+    float h2 = (pos0 >= 1) ? ring.data[uint((pos0 - 1) & 15) * HIDDEN + c] : 0.0;
+
+    F32Buf src = F32Buf(pc.src_addr);
+    F32Buf res = F32Buf(pc.residual_addr);
+    F32Buf out_buf = F32Buf(pc.out_addr);
+
+    for (uint b = 0u; b < pc.B; ++b) {
+        uint idx = b * HIDDEN + c;
+        float cur = src.data[idx];
+        int p = pos0 + int(b);
+        ring.data[uint(p & 15) * HIDDEN + c] = cur;
+        float sc = (fma(w0, h0, fma(w1, h1, fma(w2, h2, w3 * cur))) + cur) * INV_SQRT_5;
+        float val = (pc.blocks_addr != 0ul) ? sc : (res.data[idx] + sc);
+        out_buf.data[idx] = val;
+        if (pc.tap_out_addr != 0ul) {
+            F32Buf tap = F32Buf(pc.tap_out_addr);
+            tap.data[idx] = val;
+        }
+        if (pc.blocks_addr != 0ul && pc.partial_addr != 0ul) {
+            F32Buf part = F32Buf(pc.partial_addr);
+            F32Buf blks = F32Buf(pc.blocks_addr);
+            blks.data[(b * 4u + pc.block_idx) * HIDDEN + c] = part.data[idx];
+        }
+        h0 = h1; h1 = h2; h2 = cur;
+    }
+}

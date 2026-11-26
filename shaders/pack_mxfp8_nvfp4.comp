@@ -1,0 +1,87 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Two-mode MXFP8 -> NVFP4 expert bank converter (layers 20..23):
+// mode == 0: 1 workgroup per expert -> computes exp_global_scale[e] = max(|w|) / (448 * 6)
+// mode == 1: 1 thread per 16-element block -> quantizes to NVFP4 dst_w + dst_s
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t src_w_addr;
+    uint64_t src_s_addr;
+    uint64_t dst_w_addr;
+    uint64_t dst_s_addr;
+    uint64_t exp_scale_addr;
+    uint n_experts;
+    uint rows;
+    uint cols;
+    uint mode;
+    uint n_lo;          // experts [0, n_lo) -> dst_w/dst_s (VRAM), rest -> *_hi (DDR5, pre-biased)
+    uint64_t dst_w_hi_addr;
+    uint64_t dst_s_hi_addr;
+} pc;
+
+shared float s_max[8];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (pc.mode == 0u) {
+        uint e = gl_WorkGroupID.x;
+        if (e >= pc.n_experts) return;
+        uint expert_elems = pc.rows * pc.cols;
+        U8Buf ew = U8Buf(pc.src_w_addr + uint64_t(e) * uint64_t(expert_elems));
+        U8Buf es = U8Buf(pc.src_s_addr + uint64_t(e) * uint64_t(expert_elems >> 5u));
+        float lmax = 0.0;
+        for (uint idx = tid; idx < expert_elems; idx += 256u) {
+            float v = abs(decode_e4m3(uint(ew.data[idx])) * decode_ue8m0(uint(es.data[idx >> 5u])));
+            lmax = max(lmax, v);
+        }
+        float sg_max = subgroupMax(lmax);
+        if (subgroupElect()) s_max[gl_SubgroupID] = sg_max;
+        barrier();
+        if (tid == 0u) {
+            float bmax = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) bmax = max(bmax, s_max[s]);
+            F32Buf exp_sc = F32Buf(pc.exp_scale_addr);
+            exp_sc.data[e] = max(bmax / (448.0 * 6.0), 1e-12);
+        }
+        return;
+    }
+
+    uint blocks_per_expert = pc.rows * (pc.cols >> 4u);
+    uint total_blocks = pc.n_experts * blocks_per_expert;
+    uint bidx = gl_GlobalInvocationID.x;
+    if (bidx >= total_blocks) return;
+
+    uint e = bidx / blocks_per_expert;
+    F32Buf exp_sc = F32Buf(pc.exp_scale_addr);
+    float gscale = exp_sc.data[e];
+
+    uint64_t elem_off = uint64_t(bidx) * 16ul;
+    U8Buf sw = U8Buf(pc.src_w_addr + elem_off);
+    U8Buf ss = U8Buf(pc.src_s_addr + (elem_off >> 5u));
+    float mx_scale = decode_ue8m0(uint(ss.data[0]));
+
+    float vals[16];
+    float bmax = 0.0;
+    for (uint i = 0u; i < 16u; ++i) {
+        vals[i] = decode_e4m3(uint(sw.data[i])) * mx_scale;
+        bmax = max(bmax, abs(vals[i]));
+    }
+    uint s_code = encode_e4m3(min(bmax / (6.0 * gscale), 448.0));
+    bool lo_tier = e < pc.n_lo;
+    U8Buf ds = U8Buf((lo_tier ? pc.dst_s_addr : pc.dst_s_hi_addr) + uint64_t(bidx));
+    ds.data[0] = uint8_t(s_code);
+
+    float s_eff = decode_e4m3(s_code) * gscale;
+    float inv_s = (s_eff > 1e-30) ? (1.0 / s_eff) : 0.0;
+
+    U8Buf dw = U8Buf((lo_tier ? pc.dst_w_addr : pc.dst_w_hi_addr) + uint64_t(bidx) * 8ul);
+    for (uint i = 0u; i < 8u; ++i) {
+        uint q0 = quantize_e2m1(vals[2u * i] * inv_s);
+        uint q1 = quantize_e2m1(vals[2u * i + 1u] * inv_s);
+        dw.data[i] = uint8_t(q0 | (q1 << 4u));
+    }
+}

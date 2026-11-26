@@ -1,0 +1,144 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Persistent Wave64 LDS-LUT256 NVFP4 MoE Gate+Up (w13: [128, 2304, 2304]) + Zero-Barrier SwiGLU!
+// - Persistent 240 WGs (4 WGs/CU on 60-CU RX 7800 XT): builds LUT ONCE, 0 wasted WGs for u >= n_uniq!
+// - Zero-barrier SwiGLU via Wave64 subgroupShuffleXor(val, 16u) (exchanges gate/up in 1 register op)!
+// - 16-byte uvec4 X loads (4x fewer VMEM instructions) + SPEC_B scalar accumulators (0 scratch spills)!
+// Grid: (240, 1, 1), Local: 256 threads (Wave64).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint SPEC_B = 1u;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;        // [128, 2304, 1152] U8
+    uint64_t s_addr;        // [128, 2304, 144]  U8
+    uint64_t exp_sc_addr;   // [128] F32
+    uint64_t x_h_addr;      // [B, 2304] F16
+    uint64_t groups_addr;   // ExpertGroups
+    uint64_t out_act_h_addr;// [B, TOP_K, 1152] F16
+    uint B;
+    uint n_lo;              // experts [0, n_lo) live at w_addr/s_addr (VRAM)
+    uint64_t w_hi_addr;     // experts [n_lo, 128) in pinned DDR5, pre-biased by -n_lo * stride
+    uint64_t s_hi_addr;
+} pc;
+
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+
+float dot16_h2(
+    f16vec2 wh0, f16vec2 wh1, f16vec2 wh2, f16vec2 wh3,
+    f16vec2 wh4, f16vec2 wh5, f16vec2 wh6, f16vec2 wh7,
+    F16Vec2Buf x_buf, uint xo
+) {
+    f16vec2 p0 = wh0 * x_buf.data[xo + 0u];
+    f16vec2 p1 = wh1 * x_buf.data[xo + 1u];
+    p0 = fma(wh2, x_buf.data[xo + 2u], p0);
+    p1 = fma(wh3, x_buf.data[xo + 3u], p1);
+    p0 = fma(wh4, x_buf.data[xo + 4u], p0);
+    p1 = fma(wh5, x_buf.data[xo + 5u], p1);
+    p0 = fma(wh6, x_buf.data[xo + 6u], p0);
+    p1 = fma(wh7, x_buf.data[xo + 7u], p1);
+    f16vec2 s2 = p0 + p1;
+    return float(s2.x) + float(s2.y);
+}
+
+void swiglu_store(F16Buf out_act, U32Buf g_u32, uint u, uint b, uint tile, uint row_in_wg, uint lane16, float v, float es) {
+    v += subgroupShuffleXor(v, 8u);
+    v += subgroupShuffleXor(v, 4u);
+    v += subgroupShuffleXor(v, 2u);
+    v += subgroupShuffleXor(v, 1u);
+    float scaled = v * es;
+    // In Wave64, even row (gate) and odd row (up) sit 16 lanes apart in the SAME subgroup!
+    float up = subgroupShuffleXor(scaled, 16u);
+    if (lane16 == 0u && (row_in_wg & 1u) == 0u) {
+        uint p = row_in_wg >> 1u;
+        uint k_slot = g_u32.data[129u + u * 8u + b];
+        float g_cap = tanh(scaled * (1.0 / GATE_SOFTCAP)) * GATE_SOFTCAP;
+        float u_cap = tanh(up     * (1.0 / UP_SOFTCAP))   * UP_SOFTCAP;
+        float act = (g_cap * fast_sigmoid(scaled)) * u_cap;
+        out_act.data[(b * TOP_K + k_slot) * INTERMEDIATE + tile * 8u + p] = float16_t(act);
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
+    s_e4m3[tid] = decode_e4m3(tid);
+    barrier();
+
+    U32Buf g_u32 = U32Buf(pc.groups_addr);
+    uint n_uniq = g_u32.data[0u];
+    const uint N_TILES = INTERMEDIATE >> 3u; // 144 tiles of 16 rows (8 gate/up pairs)
+    uint total_tasks = n_uniq * N_TILES;
+
+    uint row_in_wg = tid >> 4u;
+    uint lane16 = tid & 15u;
+    const uint R = 2u * INTERMEDIATE;
+    const uint N_BLK16 = HIDDEN >> 4u; // 144 = 9 * 16
+    const uint cols_h2 = HIDDEN >> 1u; // 1152
+
+    F16Vec2Buf x_buf = F16Vec2Buf(pc.x_h_addr);
+    F32Buf exp_sc = F32Buf(pc.exp_sc_addr);
+    F16Buf out_act = F16Buf(pc.out_act_h_addr);
+
+    for (uint task = gl_WorkGroupID.x; task < total_tasks; task += gl_NumWorkGroups.x) {
+        uint u = task / N_TILES;
+        uint tile = task - u * N_TILES;
+        uint e = g_u32.data[1u + u];
+        uint tmask = g_u32.data[65u + u];
+        uint row = tile * 16u + row_in_wg;
+
+        uint64_t exp_row = uint64_t(e) * uint64_t(R) + uint64_t(row);
+        bool lo_tier = e < pc.n_lo;
+        Uvec2Buf w_buf = Uvec2Buf((lo_tier ? pc.w_addr : pc.w_hi_addr) + exp_row * uint64_t(N_BLK16) * 8ul);
+        U8Buf s_buf = U8Buf((lo_tier ? pc.s_addr : pc.s_hi_addr) + exp_row * uint64_t(N_BLK16));
+
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        float a4 = 0.0, a5 = 0.0, a6 = 0.0, a7 = 0.0;
+
+        for (uint iter = 0u; iter < 9u; ++iter) {
+            uint blk = lane16 + iter * 16u;
+            uvec2 w8 = w_buf.data[blk];
+            float sc = s_e4m3[uint(s_buf.data[blk])];
+
+            f16vec2 wh0 = s_e2m1x2[w8.x & 0xFFu];
+            f16vec2 wh1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu];
+            f16vec2 wh2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu];
+            f16vec2 wh3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu];
+            f16vec2 wh4 = s_e2m1x2[w8.y & 0xFFu];
+            f16vec2 wh5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu];
+            f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
+            f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
+
+            uint xb = blk * 8u;
+            if (SPEC_B == 1u) {
+                a0 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, xb), sc, a0);
+            } else {
+                if ((tmask & 1u) != 0u) a0 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, xb), sc, a0);
+                if (SPEC_B >= 2u && (tmask & 2u) != 0u) a1 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, cols_h2 + xb), sc, a1);
+                if (SPEC_B >= 4u && (tmask & 4u) != 0u) a2 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 2u * cols_h2 + xb), sc, a2);
+                if (SPEC_B >= 4u && (tmask & 8u) != 0u) a3 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 3u * cols_h2 + xb), sc, a3);
+                if (SPEC_B >= 8u && (tmask & 16u) != 0u) a4 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 4u * cols_h2 + xb), sc, a4);
+                if (SPEC_B >= 8u && (tmask & 32u) != 0u) a5 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 5u * cols_h2 + xb), sc, a5);
+                if (SPEC_B >= 8u && (tmask & 64u) != 0u) a6 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 6u * cols_h2 + xb), sc, a6);
+                if (SPEC_B >= 8u && (tmask & 128u) != 0u) a7 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 7u * cols_h2 + xb), sc, a7);
+            }
+        }
+
+        float es = exp_sc.data[e];
+        if (SPEC_B == 1u) {
+            swiglu_store(out_act, g_u32, u, 0u, tile, row_in_wg, lane16, a0, es);
+        } else {
+            if ((tmask & 1u) != 0u) swiglu_store(out_act, g_u32, u, 0u, tile, row_in_wg, lane16, a0, es);
+            if (SPEC_B >= 2u && (tmask & 2u) != 0u) swiglu_store(out_act, g_u32, u, 1u, tile, row_in_wg, lane16, a1, es);
+            if (SPEC_B >= 4u && (tmask & 4u) != 0u) swiglu_store(out_act, g_u32, u, 2u, tile, row_in_wg, lane16, a2, es);
+            if (SPEC_B >= 4u && (tmask & 8u) != 0u) swiglu_store(out_act, g_u32, u, 3u, tile, row_in_wg, lane16, a3, es);
+            if (SPEC_B >= 8u && (tmask & 16u) != 0u) swiglu_store(out_act, g_u32, u, 4u, tile, row_in_wg, lane16, a4, es);
+            if (SPEC_B >= 8u && (tmask & 32u) != 0u) swiglu_store(out_act, g_u32, u, 5u, tile, row_in_wg, lane16, a5, es);
+            if (SPEC_B >= 8u && (tmask & 64u) != 0u) swiglu_store(out_act, g_u32, u, 6u, tile, row_in_wg, lane16, a6, es);
+            if (SPEC_B >= 8u && (tmask & 128u) != 0u) swiglu_store(out_act, g_u32, u, 7u, tile, row_in_wg, lane16, a7, es);
+        }
+    }
+}

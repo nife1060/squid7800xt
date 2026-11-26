@@ -1,0 +1,139 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// DSpark Commit Shader (2 modes):
+// mode == 0: dspark_mix — mixes 4 target taps [4, B, HIDDEN] with fuse_alpha[4,4] + RMSNorm * dflare_norm
+//            Grid: (B, 4, 1), Local: 256 (Wave64)
+//            m=0..2 -> out_mix_h[m, b, HIDDEN] (FP16 for linear_nvfp4!)
+//            m=3    -> f_ring[(pos+b)&15, HIDDEN] (F32 for Markov RNN!)
+// mode == 1: dspark_store_ctx_kv — V store + per-head RMSNorm(k_norm_ctx) + NeoX RoPE(1e6) + K store (BF16 or Q4)
+//            Grid: (B, 8, 1), Local: 128 (Wave64 -> 2 subgroups of 64)
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t a0; // mode0: taps,        mode1: kv_in [B, 2*KV_DIM]
+    uint64_t a1; // mode0: fuse_alpha,  mode1: k_norm_ctx [128] BF16
+    uint64_t a2; // mode0: norm0,       mode1: k_cache
+    uint64_t a3; // mode0: norm1,       mode1: v_cache
+    uint64_t a4; // mode0: norm2,       mode1: k_scale
+    uint64_t a5; // mode0: norm3,       mode1: v_scale
+    uint64_t a6; // mode0: out_mix_h,   mode1: unused
+    uint64_t a7; // mode0: f_ring,      mode1: unused
+    uint64_t d_pos_addr;
+    uint B;
+    uint cap;
+    uint kv_fmt; // 0 = BF16, 2 = Q4
+    uint mode;
+} pc;
+
+shared float s_buf[HIDDEN];
+shared float s_kn[HEAD_DIM];
+shared float s_red[4];
+shared float s_inv_rms;
+
+void store_kv_128(float val, uint slot, uint h, uint tid, uint64_t cache_a, uint64_t scale_a) {
+    if (pc.kv_fmt == 0u) {
+        U16Buf dst = U16Buf(cache_a + (uint64_t(slot) * uint64_t(KV_DIM) + uint64_t(h * HEAD_DIM)) * 2ul);
+        dst.data[tid] = f32_to_bf16(val);
+    } else {
+        uint g = tid >> 6u;
+        float gmax = subgroupMax(abs(val));
+        float sc = max(gmax / 7.0, 1e-8);
+        if ((tid & 63u) == 0u) {
+            F16Buf sc_buf = F16Buf(q4_scale_addr(scale_a, pc.cap, slot, h) + uint64_t(g * 2u));
+            sc_buf.data[0] = float16_t(sc);
+        }
+        int q = clamp(int(round(val / sc)), -7, 7) + 7;
+        int q_odd = subgroupShuffleXor(q, 1u);
+        if ((tid & 1u) == 0u) {
+            U8Buf dst = U8Buf(q4_data_addr(cache_a, pc.cap, slot, h) + uint64_t(tid >> 1u));
+            dst.data[0] = uint8_t(uint(q) | (uint(q_odd) << 4u));
+        }
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    I32Buf pos_buf = I32Buf(pc.d_pos_addr);
+    int pos0 = pos_buf.data[0];
+
+    if (pc.mode == 0u) {
+        uint b = gl_WorkGroupID.x;
+        uint m = gl_WorkGroupID.y;
+        F32Buf fa = F32Buf(pc.a1);
+        float c0 = fa.data[m * 4u + 0u];
+        float c1 = fa.data[m * 4u + 1u];
+        float c2 = fa.data[m * 4u + 2u];
+        float c3 = fa.data[m * 4u + 3u];
+
+        F32Buf t0 = F32Buf(pc.a0 + uint64_t((0u * pc.B + b) * HIDDEN) * 4ul);
+        F32Buf t1 = F32Buf(pc.a0 + uint64_t((1u * pc.B + b) * HIDDEN) * 4ul);
+        F32Buf t2 = F32Buf(pc.a0 + uint64_t((2u * pc.B + b) * HIDDEN) * 4ul);
+        F32Buf t3 = F32Buf(pc.a0 + uint64_t((3u * pc.B + b) * HIDDEN) * 4ul);
+
+        float sum_sq = 0.0;
+        for (uint d = tid; d < HIDDEN; d += 128u) {
+            float v = c0 * t0.data[d] + c1 * t1.data[d] + c2 * t2.data[d] + c3 * t3.data[d];
+            s_buf[d] = v;
+            sum_sq = fma(v, v, sum_sq);
+        }
+        float sg = subgroupAdd(sum_sq);
+        if (subgroupElect()) s_red[gl_SubgroupID] = sg;
+        barrier();
+        if (tid == 0u) {
+            s_inv_rms = inversesqrt((s_red[0] + s_red[1]) / float(HIDDEN) + RMS_EPS);
+        }
+        barrier();
+
+        float ir = s_inv_rms;
+        uint64_t na = (m == 0u) ? pc.a2 : ((m == 1u) ? pc.a3 : ((m == 2u) ? pc.a4 : pc.a5));
+        U16Buf nw = U16Buf(na);
+        if (m < 3u) {
+            F16Buf dst = F16Buf(pc.a6 + uint64_t((m * pc.B + b) * HIDDEN) * 2ul);
+            for (uint d = tid; d < HIDDEN; d += 128u) {
+                dst.data[d] = float16_t(s_buf[d] * ir * bf16_to_f32(nw.data[d]));
+            }
+        } else {
+            uint slot = uint((pos0 + int(b)) & 15);
+            F32Buf dst = F32Buf(pc.a7 + uint64_t(slot * HIDDEN) * 4ul);
+            for (uint d = tid; d < HIDDEN; d += 128u) {
+                dst.data[d] = s_buf[d] * ir * bf16_to_f32(nw.data[d]);
+            }
+        }
+        return;
+    }
+
+    // mode == 1: store_ctx_kv
+    uint b = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    int pos = pos0 + int(b);
+    uint slot = uint(pos) % pc.cap;
+
+    F32Buf kp = F32Buf(pc.a0 + uint64_t(b * (2u * KV_DIM) + h * HEAD_DIM) * 4ul);
+    F32Buf vp = F32Buf(pc.a0 + uint64_t(b * (2u * KV_DIM) + KV_DIM + h * HEAD_DIM) * 4ul);
+
+    store_kv_128(vp.data[tid], slot, h, tid, pc.a3, pc.a5);
+    barrier();
+
+    float kval = kp.data[tid];
+    float sq = subgroupAdd(kval * kval);
+    if (subgroupElect()) s_red[gl_SubgroupID] = sq;
+    barrier();
+    float ir = inversesqrt((s_red[0] + s_red[1]) / float(HEAD_DIM) + RMS_EPS);
+    U16Buf knw = U16Buf(pc.a1);
+    s_kn[tid] = kval * ir * bf16_to_f32(knw.data[tid]);
+    barrier();
+
+    if (tid < 64u) {
+        float freq = 1.0 / pow(1000000.0, float(2u * tid) / float(HEAD_DIM));
+        float ang = float(pos) * freq;
+        float c = cos(ang), s = sin(ang);
+        float x0 = s_kn[tid], x1 = s_kn[tid + 64u];
+        s_kn[tid]       = x0 * c - x1 * s;
+        s_kn[tid + 64u] = x0 * s + x1 * c;
+    }
+    barrier();
+    store_kv_128(s_kn[tid], slot, h, tid, pc.a2, pc.a4);
+}

@@ -1,0 +1,238 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Two-stage 562 GB/s Wave64 LDS-LUT256 NVFP4 LM Head + GPU Argmax/Step!
+// Specialized on SPEC_B (1, 2, 4, 8) with scalar registers -> ZERO scratch memory spills on RDNA 3!
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 0) const uint SPEC_B = 1u;
+
+layout(push_constant) uniform PC {
+    uint64_t w_addr;
+    uint64_t s_addr;
+    uint64_t x_addr;          // [B, HIDDEN] F16
+    uint64_t blk_val_addr;    // [B, 512] F32
+    uint64_t blk_idx_addr;    // [B, 512] I32
+    uint64_t out_tokens_addr; // [B] I32
+    uint64_t d_pos_addr;      // optional [1] I32
+    uint64_t d_tokens_addr;   // optional [B] I32
+    uint64_t sample_cfg_addr; // optional [inv_temp (f32), seed_lo (u32), seed_hi (u32)]
+    uint V;                   // 200058
+    float global_scale;
+    uint B;                   // matches SPEC_B
+    uint stage;               // 0 = gemv+partial_max, 1 = final_argmax
+    uint advance_b1;
+} pc;
+
+const uint LM_BLOCKS = 512u;
+
+shared f16vec2 s_e2m1x2[256];
+shared float s_e4m3[256];
+shared float s_mv[8][16];
+shared int s_mi[8][16];
+
+float gumbel_noise(uint seed, uint pos, uint b, uint row) {
+    uint h = row * 0x9E3779B1u ^ (pos * 0x85EBCA77u) ^ (b * 0xC2B2AE3Du) ^ seed;
+    h ^= h >> 16u;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15u;
+    h *= 0x846CA68Bu;
+    h ^= h >> 16u;
+    float u = (float(h >> 8u) + 0.5) * (1.0 / 16777216.0);
+    return -log(-log(clamp(u, 1e-7, 1.0 - 1e-7)));
+}
+
+float dot16(
+    f16vec2 wh0, f16vec2 wh1, f16vec2 wh2, f16vec2 wh3,
+    f16vec2 wh4, f16vec2 wh5, f16vec2 wh6, f16vec2 wh7,
+    F16Vec2Buf x_buf, uint xo
+) {
+    f16vec2 p0 = wh0 * x_buf.data[xo + 0u];
+    f16vec2 p1 = wh1 * x_buf.data[xo + 1u];
+    p0 = fma(wh2, x_buf.data[xo + 2u], p0);
+    p1 = fma(wh3, x_buf.data[xo + 3u], p1);
+    p0 = fma(wh4, x_buf.data[xo + 4u], p0);
+    p1 = fma(wh5, x_buf.data[xo + 5u], p1);
+    p0 = fma(wh6, x_buf.data[xo + 6u], p0);
+    p1 = fma(wh7, x_buf.data[xo + 7u], p1);
+    f16vec2 s2 = p0 + p1;
+    return float(s2.x) + float(s2.y);
+}
+
+void update_best(inout float bv, inout int bi, float v, uint row, uint lane16, float inv_temp, uint seed, uint pos, uint b) {
+    v += subgroupShuffleXor(v, 8u);
+    v += subgroupShuffleXor(v, 4u);
+    v += subgroupShuffleXor(v, 2u);
+    v += subgroupShuffleXor(v, 1u);
+    if (lane16 == 0u) {
+        float val = v * pc.global_scale;
+        if (inv_temp > 0.0) {
+            val = tanh(val * (1.0 / FINAL_SOFTCAP)) * FINAL_SOFTCAP * inv_temp + gumbel_noise(seed, pos, b, row);
+        }
+        if (val > bv || (val == bv && int(row) < bi)) {
+            bv = val;
+            bi = int(row);
+        }
+    }
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    if (pc.stage == 1u) {
+        uint b = gl_WorkGroupID.x;
+        if (b >= SPEC_B) return;
+        F32Buf bval = F32Buf(pc.blk_val_addr + uint64_t(b * LM_BLOCKS) * 4ul);
+        I32Buf bidx = I32Buf(pc.blk_idx_addr + uint64_t(b * LM_BLOCKS) * 4ul);
+
+        float bv = -1e30;
+        int bi = 0;
+        for (uint i = tid; i < LM_BLOCKS; i += 256u) {
+            float v = bval.data[i];
+            int idx = bidx.data[i];
+            if (v > bv || (v == bv && idx < bi)) { bv = v; bi = idx; }
+        }
+        for (uint off = 32u; off > 0u; off >>= 1u) {
+            float ov = subgroupShuffleXor(bv, off);
+            int oi = subgroupShuffleXor(bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if ((tid & 63u) == 0u) {
+            uint sg = tid >> 6u;
+            s_mv[0][sg] = bv;
+            s_mi[0][sg] = bi;
+        }
+        barrier();
+        if (tid == 0u) {
+            bv = s_mv[0][0]; bi = s_mi[0][0];
+            for (uint s = 1u; s < 4u; ++s) {
+                if (s_mv[0][s] > bv || (s_mv[0][s] == bv && s_mi[0][s] < bi)) {
+                    bv = s_mv[0][s]; bi = s_mi[0][s];
+                }
+            }
+            I32Buf out_t = I32Buf(pc.out_tokens_addr);
+            out_t.data[b] = bi;
+            if (pc.advance_b1 != 0u && b == 0u) {
+                I32Buf dpos = I32Buf(pc.d_pos_addr);
+                I32Buf dtok = I32Buf(pc.d_tokens_addr);
+                dpos.data[0] += 1;
+                dtok.data[0] = bi;
+            }
+        }
+        return;
+    }
+
+    s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
+    s_e4m3[tid] = decode_e4m3(tid);
+    barrier();
+
+    uint row_in_wg = tid >> 4u;
+    uint lane16 = tid & 15u;
+    uint start_row = gl_WorkGroupID.x * 16u + row_in_wg;
+    uint row_stride = LM_BLOCKS * 16u;
+
+    float bv0 = -1e30, bv1 = -1e30, bv2 = -1e30, bv3 = -1e30;
+    float bv4 = -1e30, bv5 = -1e30, bv6 = -1e30, bv7 = -1e30;
+    int bi0 = 0, bi1 = 0, bi2 = 0, bi3 = 0, bi4 = 0, bi5 = 0, bi6 = 0, bi7 = 0;
+
+    float inv_temp = 0.0;
+    uint seed = 0u;
+    uint cur_pos = 0u;
+    if (pc.sample_cfg_addr != 0ul) {
+        F32Buf scf = F32Buf(pc.sample_cfg_addr);
+        U32Buf scu = U32Buf(pc.sample_cfg_addr);
+        inv_temp = scf.data[0u];
+        seed = scu.data[1u];
+        if (pc.d_pos_addr != 0ul) {
+            I32Buf dpos = I32Buf(pc.d_pos_addr);
+            cur_pos = uint(dpos.data[0u]);
+        }
+    }
+
+    F16Vec2Buf x_buf = F16Vec2Buf(pc.x_addr);
+    const uint N_BLK16 = HIDDEN >> 4u; // 144 = 9 * 16
+    const uint cols_h2 = HIDDEN >> 1u; // 1152
+
+    for (uint row = start_row; row < pc.V; row += row_stride) {
+        Uvec2Buf w_buf = Uvec2Buf(pc.w_addr + uint64_t(row) * uint64_t(N_BLK16) * 8ul);
+        U8Buf s_buf = U8Buf(pc.s_addr + uint64_t(row) * uint64_t(N_BLK16));
+
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+        float a4 = 0.0, a5 = 0.0, a6 = 0.0, a7 = 0.0;
+
+        for (uint iter = 0u; iter < 9u; ++iter) {
+            uint blk = lane16 + iter * 16u;
+            uvec2 w8 = w_buf.data[blk];
+            float sc = s_e4m3[uint(s_buf.data[blk])];
+
+            f16vec2 wh0 = s_e2m1x2[w8.x & 0xFFu];
+            f16vec2 wh1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu];
+            f16vec2 wh2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu];
+            f16vec2 wh3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu];
+            f16vec2 wh4 = s_e2m1x2[w8.y & 0xFFu];
+            f16vec2 wh5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu];
+            f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
+            f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
+
+            uint xb = blk * 8u;
+            a0 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, xb), sc, a0);
+            if (SPEC_B >= 2u) a1 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, cols_h2 + xb), sc, a1);
+            if (SPEC_B >= 4u) {
+                a2 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 2u * cols_h2 + xb), sc, a2);
+                a3 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 3u * cols_h2 + xb), sc, a3);
+            }
+            if (SPEC_B >= 8u) {
+                a4 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 4u * cols_h2 + xb), sc, a4);
+                a5 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 5u * cols_h2 + xb), sc, a5);
+                a6 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 6u * cols_h2 + xb), sc, a6);
+                a7 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 7u * cols_h2 + xb), sc, a7);
+            }
+        }
+
+        update_best(bv0, bi0, a0, row, lane16, inv_temp, seed, cur_pos, 0u);
+        if (SPEC_B >= 2u) update_best(bv1, bi1, a1, row, lane16, inv_temp, seed, cur_pos, 1u);
+        if (SPEC_B >= 4u) {
+            update_best(bv2, bi2, a2, row, lane16, inv_temp, seed, cur_pos, 2u);
+            update_best(bv3, bi3, a3, row, lane16, inv_temp, seed, cur_pos, 3u);
+        }
+        if (SPEC_B >= 8u) {
+            update_best(bv4, bi4, a4, row, lane16, inv_temp, seed, cur_pos, 4u);
+            update_best(bv5, bi5, a5, row, lane16, inv_temp, seed, cur_pos, 5u);
+            update_best(bv6, bi6, a6, row, lane16, inv_temp, seed, cur_pos, 6u);
+            update_best(bv7, bi7, a7, row, lane16, inv_temp, seed, cur_pos, 7u);
+        }
+    }
+
+    if (lane16 == 0u) {
+        s_mv[0][row_in_wg] = bv0; s_mi[0][row_in_wg] = bi0;
+        if (SPEC_B >= 2u) { s_mv[1][row_in_wg] = bv1; s_mi[1][row_in_wg] = bi1; }
+        if (SPEC_B >= 4u) {
+            s_mv[2][row_in_wg] = bv2; s_mi[2][row_in_wg] = bi2;
+            s_mv[3][row_in_wg] = bv3; s_mi[3][row_in_wg] = bi3;
+        }
+        if (SPEC_B >= 8u) {
+            s_mv[4][row_in_wg] = bv4; s_mi[4][row_in_wg] = bi4;
+            s_mv[5][row_in_wg] = bv5; s_mi[5][row_in_wg] = bi5;
+            s_mv[6][row_in_wg] = bv6; s_mi[6][row_in_wg] = bi6;
+            s_mv[7][row_in_wg] = bv7; s_mi[7][row_in_wg] = bi7;
+        }
+    }
+    barrier();
+
+    if (tid < SPEC_B) {
+        uint b = tid;
+        float bv = s_mv[b][0];
+        int bi = s_mi[b][0];
+        for (uint r = 1u; r < 16u; ++r) {
+            if (s_mv[b][r] > bv || (s_mv[b][r] == bv && s_mi[b][r] < bi)) {
+                bv = s_mv[b][r];
+                bi = s_mi[b][r];
+            }
+        }
+        F32Buf bval = F32Buf(pc.blk_val_addr);
+        I32Buf bidx = I32Buf(pc.blk_idx_addr);
+        bval.data[b * LM_BLOCKS + gl_WorkGroupID.x] = bv;
+        bidx.data[b * LM_BLOCKS + gl_WorkGroupID.x] = bi;
+    }
+}

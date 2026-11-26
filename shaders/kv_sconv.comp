@@ -1,0 +1,120 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// K and V 4-tap Short Convolution (16-slot ring, safe for B <= 8).
+// mode == 0: local static sconv (in-place on k_proj & v_proj!). Grid: (4, 2, 1), Local: 256 (1024 channels x {K,V}).
+// mode == 1: global dynamic sconv (computes dyn_taps[B, 32] = weight_proj[32, 2304] @ in_kv + applies dynamic sconv!).
+//            Grid: (2, 1, 1) -> WG 0 = K, WG 1 = V, Local: 256 (4 channels per thread).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint64_t k_proj_addr;      // [B, 1024] in/out
+    uint64_t v_proj_addr;      // [B, 1024] in/out
+    uint64_t in_k_addr;        // [B, 2304] (global only)
+    uint64_t in_v_addr;        // [B, 2304] (global only)
+    uint64_t k_sconv_w_addr;   // local: [1024, 4] BF16; global: [4, 1024] BF16
+    uint64_t v_sconv_w_addr;
+    uint64_t k_sconv_proj_addr;// global only: [32, 2304] BF16
+    uint64_t v_sconv_proj_addr;
+    uint64_t k_ring_addr;      // [16, 1024] F32
+    uint64_t v_ring_addr;
+    uint64_t d_pos_addr;       // [1] I32
+    uint B;
+    uint is_global;
+} pc;
+
+shared float s_taps[8][32];
+
+void main() {
+    I32Buf pos_buf = I32Buf(pc.d_pos_addr);
+    int pos0 = pos_buf.data[0];
+
+    if (pc.is_global == 0u) {
+        // Local static sconv: WG.x in 0..3 -> c = WG.x * 256 + tid; WG.y = 0 (K) or 1 (V)
+        uint c = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+        if (c >= KV_DIM) return;
+        bool is_v = (gl_WorkGroupID.y == 1u);
+        F32Buf xbuf = F32Buf(is_v ? pc.v_proj_addr : pc.k_proj_addr);
+        U16Buf sw = U16Buf((is_v ? pc.v_sconv_w_addr : pc.k_sconv_w_addr) + uint64_t(c) * 8ul);
+        F32Buf ring = F32Buf(is_v ? pc.v_ring_addr : pc.k_ring_addr);
+
+        float w0 = bf16_to_f32(sw.data[0]);
+        float w1 = bf16_to_f32(sw.data[1]);
+        float w2 = bf16_to_f32(sw.data[2]);
+        float w3 = bf16_to_f32(sw.data[3]);
+
+        float h0 = (pos0 >= 3) ? ring.data[uint((pos0 - 3) & 15) * KV_DIM + c] : 0.0;
+        float h1 = (pos0 >= 2) ? ring.data[uint((pos0 - 2) & 15) * KV_DIM + c] : 0.0;
+        float h2 = (pos0 >= 1) ? ring.data[uint((pos0 - 1) & 15) * KV_DIM + c] : 0.0;
+
+        for (uint b = 0u; b < pc.B; ++b) {
+            uint idx = b * KV_DIM + c;
+            float cur = xbuf.data[idx];
+            int p = pos0 + int(b);
+            ring.data[uint(p & 15) * KV_DIM + c] = cur;
+            float acc = fma(w0, h0, fma(w1, h1, fma(w2, h2, w3 * cur)));
+            xbuf.data[idx] = (acc + cur) * INV_SQRT_5;
+            h0 = h1; h1 = h2; h2 = cur;
+        }
+        return;
+    }
+
+    // Global dynamic sconv: WG.x = 0 (K) or 1 (V), 256 threads
+    uint tid = gl_LocalInvocationID.x;
+    bool is_v = (gl_WorkGroupID.x == 1u);
+    uint64_t proj_a = is_v ? pc.v_sconv_proj_addr : pc.k_sconv_proj_addr;
+    uint64_t in_a   = is_v ? pc.in_v_addr : pc.in_k_addr;
+
+    // Step 1: Compute dyn_taps[B, 32] = weight_proj[32, 2304] @ in_kv[B, 2304]
+    // 8 lanes per tap row -> 32 rows computed simultaneously by 256 threads!
+    uint tap_r = tid >> 3u;  // 0..31
+    uint lane8 = tid & 7u;   // 0..7
+    U16Buf prow = U16Buf(proj_a + uint64_t(tap_r) * uint64_t(HIDDEN) * 2ul);
+    F32Buf in_kv = F32Buf(in_a);
+
+    for (uint b = 0u; b < pc.B; ++b) {
+        float acc = 0.0;
+        uint boff = b * HIDDEN;
+        for (uint k = lane8; k < HIDDEN; k += 8u) {
+            acc = fma(bf16_to_f32(prow.data[k]), in_kv.data[boff + k], acc);
+        }
+        acc += subgroupShuffleXor(acc, 4u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 1u);
+        if (lane8 == 0u) s_taps[b][tap_r] = acc;
+    }
+    barrier();
+
+    // Step 2: Apply dynamic sconv across all 1024 channels (4 channels per thread)
+    F32Buf xbuf = F32Buf(is_v ? pc.v_proj_addr : pc.k_proj_addr);
+    U16Buf sw = U16Buf(is_v ? pc.v_sconv_w_addr : pc.k_sconv_w_addr);
+    F32Buf ring = F32Buf(is_v ? pc.v_ring_addr : pc.k_ring_addr);
+
+    for (uint c = tid; c < KV_DIM; c += 256u) {
+        uint head = c >> 7u;
+        float sw0 = bf16_to_f32(sw.data[0u * KV_DIM + c]);
+        float sw1 = bf16_to_f32(sw.data[1u * KV_DIM + c]);
+        float sw2 = bf16_to_f32(sw.data[2u * KV_DIM + c]);
+        float sw3 = bf16_to_f32(sw.data[3u * KV_DIM + c]);
+
+        float h1 = (pos0 >= 1) ? ring.data[uint((pos0 - 1) & 15) * KV_DIM + c] : 0.0;
+        float h2 = (pos0 >= 2) ? ring.data[uint((pos0 - 2) & 15) * KV_DIM + c] : 0.0;
+        float h3 = (pos0 >= 3) ? ring.data[uint((pos0 - 3) & 15) * KV_DIM + c] : 0.0;
+
+        for (uint b = 0u; b < pc.B; ++b) {
+            uint idx = b * KV_DIM + c;
+            float cur = xbuf.data[idx];
+            int p = pos0 + int(b);
+            ring.data[uint(p & 15) * KV_DIM + c] = cur;
+            uint h4 = head * 4u;
+            float acc = cur * (sw0 + s_taps[b][h4 + 0u])
+                      + h1  * (sw1 + s_taps[b][h4 + 1u])
+                      + h2  * (sw2 + s_taps[b][h4 + 2u])
+                      + h3  * (sw3 + s_taps[b][h4 + 3u]);
+            xbuf.data[idx] = (acc + cur) * INV_SQRT_9;
+            h3 = h2; h2 = h1; h1 = cur;
+        }
+    }
+}
