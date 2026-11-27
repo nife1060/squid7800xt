@@ -146,9 +146,15 @@ def load_gguf(domain, n_win):
                            for w in range(n_win)])
 
 
-def bootstrap_ci(x, n=2000, seed=0):
-    # resample whole windows would be stricter; per-token is fine for a first look
+def bootstrap_ci(x, win_ids=None, n=2000, seed=0):
     rng = np.random.default_rng(seed)
+    if win_ids is not None:
+        uniq = np.unique(win_ids)
+        w_sums = np.array([x[win_ids == w].sum() for w in uniq], dtype=np.float64)
+        w_cnts = np.array([(win_ids == w).sum() for w in uniq], dtype=np.float64)
+        idx = rng.integers(0, len(uniq), size=(n, len(uniq)))
+        means = w_sums[idx].sum(axis=1) / w_cnts[idx].sum(axis=1)
+        return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
     means = [x[rng.integers(0, len(x), len(x))].mean() for _ in range(n)]
     return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
@@ -165,14 +171,15 @@ def cmd_compare(a):
         targets = np.concatenate([toks[w * window + 1:(w + 1) * window] for w in range(n_win)])
         # skip the first positions of each window, where both models have almost no context
         pos = np.tile(np.arange(window - 1), n_win)
+        win_ids = np.repeat(np.arange(n_win), window - 1)
         valid = ~np.isnan(g["lp"])
         n_dropped = int((~valid).sum())
         m = (pos >= a.skip) & valid
-        o, g, targets = o[m], g[m], targets[m]
+        o, g, targets, win_ids = o[m], g[m], targets[m], win_ids[m]
 
         nll_o, nll_g = -o["lp"].astype(np.float64), -g["lp"].astype(np.float64)
         d = nll_o - nll_g
-        lo, hi = bootstrap_ci(d)
+        lo, hi = bootstrap_ci(d, win_ids)
 
         # approx KL(gguf || ours) over gguf's top-K; ours' logprob for tokens outside its top-K is
         # capped at its K-th logprob (an over-estimate of q, so this under-estimates KL slightly)

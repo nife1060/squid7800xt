@@ -74,6 +74,7 @@ pub fn build(b: *std.Build) void {
         const spv = cmd.addOutputFileArg(sh.out);
         cmd.addFileArg(b.path(sh.src));
         cmd.addFileInput(b.path("shaders/common.glsl"));
+        cmd.addFileInput(b.path("shaders/nvfp4_scale_search.glsl"));
         root_module.addAnonymousImport(sh.name, .{ .root_source_file = spv });
     }
 

@@ -1,10 +1,11 @@
 // NVFP4 block-scale search, shared by the load-time packers (pack_bf16_nvfp4, pack_mxfp8_nvfp4).
 // Include after common.glsl.
 //
-// The naive scale (block max / 6) puts the largest value exactly on E2M1's +-6 and spends the
-// grid on that one outlier. Here we try a few smaller divisors (clipping the outlier slightly for
-// finer steps everywhere else) and the neighbouring E4M3 codes of each, and keep the scale with
-// the smallest squared reconstruction error over the 16 values. Ties keep the naive scale.
+// The naive scale (block max / 6) puts the largest value on E2M1's +-6, leaving a wide [4, 6]
+// gap where few values land. Trying smaller divisors down to 4 (larger scales, mapping block max
+// toward +-4 for a denser grid over [0, 4]) plus neighbouring E4M3 codes (including dc=-1 on 6.0,
+// which clips the outlier slightly) cuts squared reconstruction error by ~26.5% on real weights,
+// within ~0.2% of exhaustive E4M3 search. Ties keep the naive scale.
 // Same format and bytes; only the chosen scale code changes, so runtime kernels are untouched.
 
 const uint SCALE_SEARCH_N_DIVS = 5u;

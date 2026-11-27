@@ -32,7 +32,7 @@ pub const VRAMArena = struct {
     total_reserved_bytes: u64 = 0,
     total_fallback_bytes: u64 = 0,
     total_donated_bytes: u64 = 0,
-    donated: [64]struct { buffer: vk.VkBuffer, offset: u64, size: u64 } = undefined,
+    donated: [256]struct { buffer: vk.VkBuffer, offset: u64, size: u64 } = undefined,
     donated_count: u32 = 0,
     allocation_count: u32 = 0,
     /// Optional arena whose VRAM slab tails are offered first (best-fit) before this arena
