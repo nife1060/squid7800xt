@@ -98,3 +98,24 @@ Baseline: `unsloth/Inkling-2-Mini-GGUF:UD-IQ4_XS` (15.73 GiB) -> **24–25 tok/s
   - Perplexity: flat (WikiText-2 `7.1557 → 7.1557`, code `2.340 → 2.345`, both well inside noise).
   - Distance to the independently quantized `UD-IQ4_XS`: KL **0.0215 → 0.0170** (wiki, window-bootstrap CI of the change [−0.0058, −0.0033]) and **0.0135 → 0.0108** (code, [−0.0050, −0.0007]); top-1 agreement 93.2% → 93.7%. Two independent quantizations share only the original model, so moving closer to the GGUF indicates less quantization noise in ours, even though perplexity is too coarse to show it at this sample size.
   - **Verdict:** KEEP (free, measurably higher fidelity).
+
+- **Exp 14 — Audit Fixes + 1-Wave64 Zero-LDS `depth_norm.comp` + Vectorized 4-Wave `linear_bf16.comp`:**
+  - Audit fixes: added `shaders/nvfp4_scale_search.glsl` to `build.zig` shader inputs (prevents stale SPIR-V cache), corrected inverted scale-search comment, upgraded `eval/quality.py` to window-level bootstrap CIs, raised `VRAMArena.donated` cap `64 → 256`, added `--kv bf16|q4`.
+  - Rewrote `depth_norm.comp` as 1 Wave64 (64 threads), zero LDS (was 18.5 KB), zero workgroup barriers (was 6), 16-byte `Vec4Buf` I/O (`2304 = 64 × 9 × 4`); vectorized `linear_bf16.comp` with `uvec2` 8-byte loads (4 Wave64s, 12 VGPRs).
+  - Results: eliminated `post_res` pipeline drain stall (`1.39 → 0.55 ms`); `mtp=0` jumped **`82.13 → 88.60 tok/s` (+7.9%)** (`B=1` `12.52 → 11.50 ms`), `mtp=7` (256-tok) **`86.52 → 91.25 tok/s` (+5.5%)**.
+  - **Verdict:** KEEP.
+
+- **Exp 15 — LDS-Cached `x` in `linear_nvfp4.comp` & `moe_up.comp` (RDNA 3 Small-Batch Hill-Climb):**
+  - `linear_nvfp4.comp`: for `SPEC_B >= 2`, cooperatively stages each 16-block chunk of `x` into bank-conflict-free padded LDS `s_x[SPEC_B][16][9]` (16× fewer global `x` loads across the 16 WG rows).
+  - `moe_up.comp`: `SPEC_B == 2` caches full `x` in LDS once at kernel start (`11.2 KB`, 4 WGs/CU); `SPEC_B == 4` uses padded chunked LDS `s_xtile[4][16][9]` (`4.3 KB`, all 256 threads loading, keeping full 4 WGs/CU occupancy); `SPEC_B == 1, 8` stay direct.
+  - Tried & reverted: 1-Wave64 `route_topk.comp` (48-elem local arrays spilled to RDNA 3 scratch VRAM, regressing `router` to `5.02 ms` at B=8); full-LDS `s_xfull` for `moe_up B=4` (20.4 KB dropped occupancy to 3 WGs/CU: `10.60 → 13.38 ms`).
+  - Results (with NVFP4 LM head): `qkvrg` B=8 **`8.31 → 4.61 ms` (−45%)**, DSpark draft **`1.58 → 1.19 ms` (K=3)** and **`1.81 → 1.34 ms` (K=7)**, `B=4` verify **`26.01 → 22.92 ms`**, `B=8` verify **`42.45 → 36.59 ms`**, `mtp=0` **`89.04 tok/s`**, 512-tok `mtp=7` **`108.43 tok/s`** (up from `100.58`).
+  - **Verdict:** KEEP.
+
+- **Exp 16 — Group-32 Asymmetric Q4_1 KV Cache + Per-Row FP8 E4M3 LM Head (`unembed`):**
+  - Quality attribution on WikiText-2 found ~1/3 of the `+1.25%` gap was group-64 symmetric Q4 KV (`+1.25% → +0.85%` with `--kv bf16`, `dNLL = −0.00401`, significant) and another ~1/3 was the NVFP4 LM head (`−0.00320` with BF16 LM head, significant).
+  - **Exp 16a (Q4_1 KV):** upgraded global Q4 KV (`attn_prep_store`, `dspark_commit`, `attn_tile`) to group-32 asymmetric `uint4 [0..15]` with per-32-dim FP16 `(lo, scale)` matching `attn_tile`'s 32-dim lane slice (+17.6% KV bytes; `attncheck` ALL PASS `7.654e-4`, `attn_core` B=8 `2.68 → 1.86 ms`). Alone cut KL `0.0170 → 0.0152` (wiki, CI `[−0.0025, −0.0011]`) and `0.0108 → 0.0097` (code, CI `[−0.0020, −0.0003]`).
+  - **Exp 16b (FP8 E4M3 LM Head):** packs `unembed` to per-row FP8 E4M3 (`31.57 dB` SNR, `+199 MiB` VRAM, 16-byte `uvec4` loads in `lm_head_argmax.comp` with `1/64`-scaled FP16 LUT for zero overflow risk + `stage=2` logits dump for `score`).
+  - Combined quality vs `UD-IQ4_XS`: WikiText-2 gap **`+1.25% → +0.85%`** (`7.1557 → 7.1270`, paired `dNLL = −0.00402`, window-CI `[−0.00776, −0.00058]`, top-1 agree `93.70% → 94.34%`, KL `0.0170 → 0.0141`, p99 `0.1619 → 0.1206`); HumanEval code **`2.3448 → 2.3406` (−0.11% vs GGUF)**, top-1 agree `96.92%`, KL `0.0099`.
+  - Combined speed: `mtp=0` **`85.27 tok/s`** (still +3.8% over Exp 13's `82.14`), 256-tok `mtp=7` **`93.15 tok/s`** (was `86.52`), 512-tok `mtp=7` **`100.92 tok/s`** (even with `--expert-tier 0` spilling 0.19 GiB local state), 128K `longctx` `DDR5_KV=0.00 GiB` (tier 16, `33.6 tok/s` B=1 / `41.5 tok/s` MTP est. at `pos=130K`).
+  - **Verdict:** KEEP ALL.

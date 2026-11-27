@@ -3,10 +3,10 @@
 #include "common.glsl"
 
 // Fused: partial = rmsnorm(hidden, null) + depth_attn(blocks, partial, queries[s]) + optional rmsnorm(norm[s]) + F16 copy!
-// Grid: (B, n_out, 1), Local: 256 threads (Wave64 -> 4 subgroups).
-// Handles n_out = 1 (local / MLP / final output) OR n_out = 3 (global Q/K/V) in ONE dispatch!
+// Grid: (B, n_out, 1), Local: 64 threads (1 Wave64 -> ZERO LDS, ZERO barriers!).
+// HIDDEN = 2304 = 64 lanes * 9 vec4s: every lane holds its 9 vec4s in registers with 16-byte coalesced I/O.
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint64_t hidden_addr;
@@ -26,135 +26,219 @@ layout(push_constant) uniform PC {
     uint B;
 } pc;
 
-shared float s_partial[HIDDEN];
-shared float s_val[HIDDEN];
-shared float s_red[8];
-shared float s_partials[8][8];
-shared float s_weights[8];
-shared float s_inv_rms;
+vec4 unpack_bf16x4(uvec2 u) {
+    return vec4(
+        uintBitsToFloat(u.x << 16u),
+        uintBitsToFloat(u.x & 0xFFFF0000u),
+        uintBitsToFloat(u.y << 16u),
+        uintBitsToFloat(u.y & 0xFFFF0000u)
+    );
+}
+
+vec4 round_bf16x4(vec4 v) {
+    return vec4(round_bf16(v.x), round_bf16(v.y), round_bf16(v.z), round_bf16(v.w));
+}
+
+uvec2 pack_f16x4(vec4 v) {
+    return uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw));
+}
 
 void main() {
     uint b = gl_WorkGroupID.x;
     uint s = gl_WorkGroupID.y;
-    uint tid = gl_LocalInvocationID.x;
+    uint lane = gl_LocalInvocationID.x;
     if (b >= pc.B) return;
 
-    F32Buf hb = F32Buf(pc.hidden_addr + uint64_t(b * HIDDEN) * 4ul);
-    float sum_sq = 0.0;
-    for (uint d = tid; d < HIDDEN; d += 256u) {
-        float v = hb.data[d];
-        s_partial[d] = v;
-        sum_sq = fma(v, v, sum_sq);
-    }
-    float sg = subgroupAdd(sum_sq);
-    if (subgroupElect()) s_red[gl_SubgroupID] = sg;
-    barrier();
-    if (tid == 0u) {
-        float tot = 0.0;
-        for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += s_red[i];
-        s_inv_rms = inversesqrt(tot / float(HIDDEN) + RMS_EPS);
-    }
-    barrier();
+    Vec4Buf hb = Vec4Buf(pc.hidden_addr + uint64_t(b * HIDDEN) * 4ul);
+    vec4 p0 = hb.data[lane + 0u * 64u];
+    vec4 p1 = hb.data[lane + 1u * 64u];
+    vec4 p2 = hb.data[lane + 2u * 64u];
+    vec4 p3 = hb.data[lane + 3u * 64u];
+    vec4 p4 = hb.data[lane + 4u * 64u];
+    vec4 p5 = hb.data[lane + 5u * 64u];
+    vec4 p6 = hb.data[lane + 6u * 64u];
+    vec4 p7 = hb.data[lane + 7u * 64u];
+    vec4 p8 = hb.data[lane + 8u * 64u];
 
-    float ir = s_inv_rms;
-    bool write_p = (s == 0u && pc.partial_out_addr != 0ul);
-    F32Buf po = F32Buf(pc.partial_out_addr + uint64_t(b * HIDDEN) * 4ul);
-    for (uint d = tid; d < HIDDEN; d += 256u) {
-        float pv = s_partial[d] * ir;
-        s_partial[d] = pv;
-        if (write_p) po.data[d] = pv;
+    float sum_sq = dot(p0, p0) + dot(p1, p1) + dot(p2, p2) + dot(p3, p3)
+                 + dot(p4, p4) + dot(p5, p5) + dot(p6, p6) + dot(p7, p7) + dot(p8, p8);
+    float ir = inversesqrt(subgroupAdd(sum_sq) / float(HIDDEN) + RMS_EPS);
+
+    p0 *= ir; p1 *= ir; p2 *= ir; p3 *= ir; p4 *= ir; p5 *= ir; p6 *= ir; p7 *= ir; p8 *= ir;
+
+    if (s == 0u && pc.partial_out_addr != 0ul) {
+        Vec4Buf po = Vec4Buf(pc.partial_out_addr + uint64_t(b * HIDDEN) * 4ul);
+        po.data[lane + 0u * 64u] = p0; po.data[lane + 1u * 64u] = p1; po.data[lane + 2u * 64u] = p2;
+        po.data[lane + 3u * 64u] = p3; po.data[lane + 4u * 64u] = p4; po.data[lane + 5u * 64u] = p5;
+        po.data[lane + 6u * 64u] = p6; po.data[lane + 7u * 64u] = p7; po.data[lane + 8u * 64u] = p8;
     }
-    barrier();
 
     uint64_t norm_a = (s == 0u) ? pc.norm0_addr : ((s == 1u) ? pc.norm1_addr : pc.norm2_addr);
     uint64_t out_a  = (s == 0u) ? pc.out0_addr  : ((s == 1u) ? pc.out1_addr  : pc.out2_addr);
     uint64_t outh_a = (s == 0u) ? pc.out_h0_addr: ((s == 1u) ? pc.out_h1_addr: pc.out_h2_addr);
 
-    F32Buf ob = F32Buf(out_a + uint64_t(b * HIDDEN) * 4ul);
-    F16Buf ohb = F16Buf(outh_a + uint64_t(b * HIDDEN) * 2ul);
+    Vec4Buf ob = Vec4Buf(out_a + uint64_t(b * HIDDEN) * 4ul);
+    Uvec2Buf ohb = Uvec2Buf(outh_a + uint64_t(b * HIDDEN) * 2ul);
 
     if (pc.queries_addr != 0ul) {
-        F32Buf q = F32Buf(pc.queries_addr + uint64_t(s * HIDDEN) * 4ul);
-        uint n_cand = pc.n_blocks + 1u;
-        for (uint c = 0u; c < n_cand; ++c) {
-            float acc = 0.0;
-            if (c < pc.n_blocks) {
-                F32Buf blk = F32Buf(pc.blocks_addr + uint64_t((b * 4u + c) * HIDDEN) * 4ul);
-                for (uint d = tid; d < HIDDEN; d += 256u) acc = fma(q.data[d], blk.data[d], acc);
-            } else {
-                for (uint d = tid; d < HIDDEN; d += 256u) acc = fma(q.data[d], s_partial[d], acc);
-            }
-            float sga = subgroupAdd(acc);
-            if (subgroupElect()) s_partials[gl_SubgroupID][c] = sga;
-        }
-        barrier();
-        if (tid == 0u) {
-            float logits[8];
-            float mx = -1e30;
-            for (uint c = 0u; c < n_cand; ++c) {
-                float dot = 0.0;
-                for (uint w = 0u; w < gl_NumSubgroups; ++w) dot += s_partials[w][c];
-                logits[c] = dot * INV_SQRT_HIDDEN;
-                mx = max(mx, logits[c]);
-            }
-            float den = 0.0;
-            for (uint c = 0u; c < n_cand; ++c) {
-                s_weights[c] = exp(logits[c] - mx);
-                den += s_weights[c];
-            }
-            float inv_d = 1.0 / den;
-            for (uint c = 0u; c < n_cand; ++c) s_weights[c] *= inv_d;
-        }
-        barrier();
+        Vec4Buf q = Vec4Buf(pc.queries_addr + uint64_t(s * HIDDEN) * 4ul);
+        vec4 q0 = q.data[lane + 0u * 64u];
+        vec4 q1 = q.data[lane + 1u * 64u];
+        vec4 q2 = q.data[lane + 2u * 64u];
+        vec4 q3 = q.data[lane + 3u * 64u];
+        vec4 q4 = q.data[lane + 4u * 64u];
+        vec4 q5 = q.data[lane + 5u * 64u];
+        vec4 q6 = q.data[lane + 6u * 64u];
+        vec4 q7 = q.data[lane + 7u * 64u];
+        vec4 q8 = q.data[lane + 8u * 64u];
 
-        float n_sq = 0.0;
-        for (uint d = tid; d < HIDDEN; d += 256u) {
-            float v = s_weights[pc.n_blocks] * s_partial[d];
-            for (uint c = 0u; c < pc.n_blocks; ++c) {
-                F32Buf blk = F32Buf(pc.blocks_addr + uint64_t((b * 4u + c) * HIDDEN) * 4ul);
-                v = fma(s_weights[c], blk.data[d], v);
-            }
-            s_val[d] = v;
-            n_sq = fma(v, v, n_sq);
+        float dp = dot(q0, p0) + dot(q1, p1) + dot(q2, p2) + dot(q3, p3)
+                 + dot(q4, p4) + dot(q5, p5) + dot(q6, p6) + dot(q7, p7) + dot(q8, p8);
+        float lp = subgroupAdd(dp) * INV_SQRT_HIDDEN;
+
+        float l0 = -1e30, l1 = -1e30, l2 = -1e30, l3 = -1e30;
+        if (pc.n_blocks > 0u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 0u) * HIDDEN) * 4ul);
+            float d = dot(q0, blk.data[lane + 0u * 64u]) + dot(q1, blk.data[lane + 1u * 64u])
+                    + dot(q2, blk.data[lane + 2u * 64u]) + dot(q3, blk.data[lane + 3u * 64u])
+                    + dot(q4, blk.data[lane + 4u * 64u]) + dot(q5, blk.data[lane + 5u * 64u])
+                    + dot(q6, blk.data[lane + 6u * 64u]) + dot(q7, blk.data[lane + 7u * 64u])
+                    + dot(q8, blk.data[lane + 8u * 64u]);
+            l0 = subgroupAdd(d) * INV_SQRT_HIDDEN;
         }
+        if (pc.n_blocks > 1u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 1u) * HIDDEN) * 4ul);
+            float d = dot(q0, blk.data[lane + 0u * 64u]) + dot(q1, blk.data[lane + 1u * 64u])
+                    + dot(q2, blk.data[lane + 2u * 64u]) + dot(q3, blk.data[lane + 3u * 64u])
+                    + dot(q4, blk.data[lane + 4u * 64u]) + dot(q5, blk.data[lane + 5u * 64u])
+                    + dot(q6, blk.data[lane + 6u * 64u]) + dot(q7, blk.data[lane + 7u * 64u])
+                    + dot(q8, blk.data[lane + 8u * 64u]);
+            l1 = subgroupAdd(d) * INV_SQRT_HIDDEN;
+        }
+        if (pc.n_blocks > 2u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 2u) * HIDDEN) * 4ul);
+            float d = dot(q0, blk.data[lane + 0u * 64u]) + dot(q1, blk.data[lane + 1u * 64u])
+                    + dot(q2, blk.data[lane + 2u * 64u]) + dot(q3, blk.data[lane + 3u * 64u])
+                    + dot(q4, blk.data[lane + 4u * 64u]) + dot(q5, blk.data[lane + 5u * 64u])
+                    + dot(q6, blk.data[lane + 6u * 64u]) + dot(q7, blk.data[lane + 7u * 64u])
+                    + dot(q8, blk.data[lane + 8u * 64u]);
+            l2 = subgroupAdd(d) * INV_SQRT_HIDDEN;
+        }
+        if (pc.n_blocks > 3u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 3u) * HIDDEN) * 4ul);
+            float d = dot(q0, blk.data[lane + 0u * 64u]) + dot(q1, blk.data[lane + 1u * 64u])
+                    + dot(q2, blk.data[lane + 2u * 64u]) + dot(q3, blk.data[lane + 3u * 64u])
+                    + dot(q4, blk.data[lane + 4u * 64u]) + dot(q5, blk.data[lane + 5u * 64u])
+                    + dot(q6, blk.data[lane + 6u * 64u]) + dot(q7, blk.data[lane + 7u * 64u])
+                    + dot(q8, blk.data[lane + 8u * 64u]);
+            l3 = subgroupAdd(d) * INV_SQRT_HIDDEN;
+        }
+
+        float mx = lp;
+        if (pc.n_blocks > 0u) mx = max(mx, l0);
+        if (pc.n_blocks > 1u) mx = max(mx, l1);
+        if (pc.n_blocks > 2u) mx = max(mx, l2);
+        if (pc.n_blocks > 3u) mx = max(mx, l3);
+
+        float wp = exp(lp - mx);
+        float w0 = (pc.n_blocks > 0u) ? exp(l0 - mx) : 0.0;
+        float w1 = (pc.n_blocks > 1u) ? exp(l1 - mx) : 0.0;
+        float w2 = (pc.n_blocks > 2u) ? exp(l2 - mx) : 0.0;
+        float w3 = (pc.n_blocks > 3u) ? exp(l3 - mx) : 0.0;
+        float inv_d = 1.0 / (wp + w0 + w1 + w2 + w3);
+        wp *= inv_d; w0 *= inv_d; w1 *= inv_d; w2 *= inv_d; w3 *= inv_d;
+
+        // Reuse p0..p8 for the depth-weighted output (0 extra VGPRs!)
+        p0 *= wp; p1 *= wp; p2 *= wp; p3 *= wp; p4 *= wp; p5 *= wp; p6 *= wp; p7 *= wp; p8 *= wp;
+        if (pc.n_blocks > 0u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 0u) * HIDDEN) * 4ul);
+            p0 = fma(vec4(w0), blk.data[lane + 0u * 64u], p0);
+            p1 = fma(vec4(w0), blk.data[lane + 1u * 64u], p1);
+            p2 = fma(vec4(w0), blk.data[lane + 2u * 64u], p2);
+            p3 = fma(vec4(w0), blk.data[lane + 3u * 64u], p3);
+            p4 = fma(vec4(w0), blk.data[lane + 4u * 64u], p4);
+            p5 = fma(vec4(w0), blk.data[lane + 5u * 64u], p5);
+            p6 = fma(vec4(w0), blk.data[lane + 6u * 64u], p6);
+            p7 = fma(vec4(w0), blk.data[lane + 7u * 64u], p7);
+            p8 = fma(vec4(w0), blk.data[lane + 8u * 64u], p8);
+        }
+        if (pc.n_blocks > 1u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 1u) * HIDDEN) * 4ul);
+            p0 = fma(vec4(w1), blk.data[lane + 0u * 64u], p0);
+            p1 = fma(vec4(w1), blk.data[lane + 1u * 64u], p1);
+            p2 = fma(vec4(w1), blk.data[lane + 2u * 64u], p2);
+            p3 = fma(vec4(w1), blk.data[lane + 3u * 64u], p3);
+            p4 = fma(vec4(w1), blk.data[lane + 4u * 64u], p4);
+            p5 = fma(vec4(w1), blk.data[lane + 5u * 64u], p5);
+            p6 = fma(vec4(w1), blk.data[lane + 6u * 64u], p6);
+            p7 = fma(vec4(w1), blk.data[lane + 7u * 64u], p7);
+            p8 = fma(vec4(w1), blk.data[lane + 8u * 64u], p8);
+        }
+        if (pc.n_blocks > 2u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 2u) * HIDDEN) * 4ul);
+            p0 = fma(vec4(w2), blk.data[lane + 0u * 64u], p0);
+            p1 = fma(vec4(w2), blk.data[lane + 1u * 64u], p1);
+            p2 = fma(vec4(w2), blk.data[lane + 2u * 64u], p2);
+            p3 = fma(vec4(w2), blk.data[lane + 3u * 64u], p3);
+            p4 = fma(vec4(w2), blk.data[lane + 4u * 64u], p4);
+            p5 = fma(vec4(w2), blk.data[lane + 5u * 64u], p5);
+            p6 = fma(vec4(w2), blk.data[lane + 6u * 64u], p6);
+            p7 = fma(vec4(w2), blk.data[lane + 7u * 64u], p7);
+            p8 = fma(vec4(w2), blk.data[lane + 8u * 64u], p8);
+        }
+        if (pc.n_blocks > 3u) {
+            Vec4Buf blk = Vec4Buf(pc.blocks_addr + uint64_t((b * 4u + 3u) * HIDDEN) * 4ul);
+            p0 = fma(vec4(w3), blk.data[lane + 0u * 64u], p0);
+            p1 = fma(vec4(w3), blk.data[lane + 1u * 64u], p1);
+            p2 = fma(vec4(w3), blk.data[lane + 2u * 64u], p2);
+            p3 = fma(vec4(w3), blk.data[lane + 3u * 64u], p3);
+            p4 = fma(vec4(w3), blk.data[lane + 4u * 64u], p4);
+            p5 = fma(vec4(w3), blk.data[lane + 5u * 64u], p5);
+            p6 = fma(vec4(w3), blk.data[lane + 6u * 64u], p6);
+            p7 = fma(vec4(w3), blk.data[lane + 7u * 64u], p7);
+            p8 = fma(vec4(w3), blk.data[lane + 8u * 64u], p8);
+        }
+
         if (norm_a != 0ul) {
-            float sgn = subgroupAdd(n_sq);
-            if (subgroupElect()) s_red[gl_SubgroupID] = sgn;
-            barrier();
-            if (tid == 0u) {
-                float tot = 0.0;
-                for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += s_red[i];
-                s_inv_rms = inversesqrt(tot / float(HIDDEN) + RMS_EPS);
-            }
-            barrier();
-            float s2 = s_inv_rms;
-            U16Buf nw = U16Buf(norm_a);
-            for (uint d = tid; d < HIDDEN; d += 256u) {
-                float v = s_val[d] * s2 * bf16_to_f32(nw.data[d]);
-                ob.data[d] = v;
-                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
-            }
-        } else {
-            for (uint d = tid; d < HIDDEN; d += 256u) {
-                float v = s_val[d];
-                ob.data[d] = v;
-                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
-            }
+            float n_sq = dot(p0, p0) + dot(p1, p1) + dot(p2, p2) + dot(p3, p3)
+                       + dot(p4, p4) + dot(p5, p5) + dot(p6, p6) + dot(p7, p7) + dot(p8, p8);
+            float s2 = inversesqrt(subgroupAdd(n_sq) / float(HIDDEN) + RMS_EPS);
+            Uvec2Buf nw = Uvec2Buf(norm_a);
+            p0 = p0 * s2 * unpack_bf16x4(nw.data[lane + 0u * 64u]);
+            p1 = p1 * s2 * unpack_bf16x4(nw.data[lane + 1u * 64u]);
+            p2 = p2 * s2 * unpack_bf16x4(nw.data[lane + 2u * 64u]);
+            p3 = p3 * s2 * unpack_bf16x4(nw.data[lane + 3u * 64u]);
+            p4 = p4 * s2 * unpack_bf16x4(nw.data[lane + 4u * 64u]);
+            p5 = p5 * s2 * unpack_bf16x4(nw.data[lane + 5u * 64u]);
+            p6 = p6 * s2 * unpack_bf16x4(nw.data[lane + 6u * 64u]);
+            p7 = p7 * s2 * unpack_bf16x4(nw.data[lane + 7u * 64u]);
+            p8 = p8 * s2 * unpack_bf16x4(nw.data[lane + 8u * 64u]);
         }
-    } else {
-        if (norm_a != 0ul) {
-            U16Buf nw = U16Buf(norm_a);
-            for (uint d = tid; d < HIDDEN; d += 256u) {
-                float v = round_bf16(s_partial[d]) * bf16_to_f32(nw.data[d]);
-                ob.data[d] = v;
-                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
-            }
-        } else {
-            for (uint d = tid; d < HIDDEN; d += 256u) {
-                float v = s_partial[d];
-                ob.data[d] = v;
-                if (outh_a != 0ul) ohb.data[d] = float16_t(v);
-            }
-        }
+    } else if (norm_a != 0ul) {
+        Uvec2Buf nw = Uvec2Buf(norm_a);
+        p0 = round_bf16x4(p0) * unpack_bf16x4(nw.data[lane + 0u * 64u]);
+        p1 = round_bf16x4(p1) * unpack_bf16x4(nw.data[lane + 1u * 64u]);
+        p2 = round_bf16x4(p2) * unpack_bf16x4(nw.data[lane + 2u * 64u]);
+        p3 = round_bf16x4(p3) * unpack_bf16x4(nw.data[lane + 3u * 64u]);
+        p4 = round_bf16x4(p4) * unpack_bf16x4(nw.data[lane + 4u * 64u]);
+        p5 = round_bf16x4(p5) * unpack_bf16x4(nw.data[lane + 5u * 64u]);
+        p6 = round_bf16x4(p6) * unpack_bf16x4(nw.data[lane + 6u * 64u]);
+        p7 = round_bf16x4(p7) * unpack_bf16x4(nw.data[lane + 7u * 64u]);
+        p8 = round_bf16x4(p8) * unpack_bf16x4(nw.data[lane + 8u * 64u]);
+    }
+
+    ob.data[lane + 0u * 64u] = p0; ob.data[lane + 1u * 64u] = p1; ob.data[lane + 2u * 64u] = p2;
+    ob.data[lane + 3u * 64u] = p3; ob.data[lane + 4u * 64u] = p4; ob.data[lane + 5u * 64u] = p5;
+    ob.data[lane + 6u * 64u] = p6; ob.data[lane + 7u * 64u] = p7; ob.data[lane + 8u * 64u] = p8;
+    if (outh_a != 0ul) {
+        ohb.data[lane + 0u * 64u] = pack_f16x4(p0);
+        ohb.data[lane + 1u * 64u] = pack_f16x4(p1);
+        ohb.data[lane + 2u * 64u] = pack_f16x4(p2);
+        ohb.data[lane + 3u * 64u] = pack_f16x4(p3);
+        ohb.data[lane + 4u * 64u] = pack_f16x4(p4);
+        ohb.data[lane + 5u * 64u] = pack_f16x4(p5);
+        ohb.data[lane + 6u * 64u] = pack_f16x4(p6);
+        ohb.data[lane + 7u * 64u] = pack_f16x4(p7);
+        ohb.data[lane + 8u * 64u] = pack_f16x4(p8);
     }
 }

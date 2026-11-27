@@ -2,33 +2,38 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-// Two-stage 562 GB/s Wave64 LDS-LUT256 NVFP4 LM Head + GPU Argmax/Step!
+// Two-stage Wave64 LDS-LUT256 Per-Row FP8 E4M3 LM Head + GPU Argmax/Gumbel-Max Sampling!
 // Specialized on SPEC_B (1, 2, 4, 8) with scalar registers -> ZERO scratch memory spills on RDNA 3!
+// - Weights: [V, HIDDEN] U8 E4M3 (16-byte uvec4 coalesced loads, 16 weights/load)
+// - Scales:  [V] F32 per-row scale pre-multiplied by 64.0 (LUT stores decode_e4m3/64 in [-7,+7],
+//            exact binary shift in FP16 -> zero FP16 overflow risk + full dual-rate v_pk_fma_f16!)
+// - stage == 0: persistent GEMV + per-WG argmax/Gumbel-Max (512 WGs)
+// - stage == 1: final reduction across 512 WGs -> out_tokens[B] (+ optional B=1 pos/token advance)
+// - stage == 2: full-vocab F32 logits dump into blk_val_addr [B, V] (for `score` subcommand)
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint SPEC_B = 1u;
 
 layout(push_constant) uniform PC {
-    uint64_t w_addr;
-    uint64_t s_addr;
+    uint64_t w_addr;          // [V, HIDDEN] U8 E4M3
+    uint64_t s_addr;          // [V] F32 per-row scale (* 64.0)
     uint64_t x_addr;          // [B, HIDDEN] F16
-    uint64_t blk_val_addr;    // [B, 512] F32
+    uint64_t blk_val_addr;    // stage 0/1: [B, 512] F32; stage 2: [B, V] F32 logits out
     uint64_t blk_idx_addr;    // [B, 512] I32
     uint64_t out_tokens_addr; // [B] I32
     uint64_t d_pos_addr;      // optional [1] I32
     uint64_t d_tokens_addr;   // optional [B] I32
     uint64_t sample_cfg_addr; // optional [inv_temp (f32), seed_lo (u32), seed_hi (u32)]
     uint V;                   // 200058
-    float global_scale;
+    float global_scale;       // unused for per-row FP8 (kept for PC layout stability)
     uint B;                   // matches SPEC_B
-    uint stage;               // 0 = gemv+partial_max, 1 = final_argmax
+    uint stage;               // 0 = gemv+partial_max, 1 = final_argmax, 2 = dump full logits
     uint advance_b1;
 } pc;
 
 const uint LM_BLOCKS = 512u;
 
-shared f16vec2 s_e2m1x2[256];
-shared float s_e4m3[256];
+shared float16_t s_e4m3_h[256]; // decode_e4m3(c) / 64.0 in [-7, +7] (exact in FP16!)
 shared float s_mv[8][16];
 shared int s_mi[8][16];
 
@@ -60,13 +65,13 @@ float dot16(
     return float(s2.x) + float(s2.y);
 }
 
-void update_best(inout float bv, inout int bi, float v, uint row, uint lane16, float inv_temp, uint seed, uint pos, uint b) {
+void update_best(inout float bv, inout int bi, float v, float rsc, uint row, uint lane16, float inv_temp, uint seed, uint pos, uint b) {
     v += subgroupShuffleXor(v, 8u);
     v += subgroupShuffleXor(v, 4u);
     v += subgroupShuffleXor(v, 2u);
     v += subgroupShuffleXor(v, 1u);
     if (lane16 == 0u) {
-        float val = v * pc.global_scale;
+        float val = v * rsc;
         if (inv_temp > 0.0) {
             val = tanh(val * (1.0 / FINAL_SOFTCAP)) * FINAL_SOFTCAP * inv_temp + gumbel_noise(seed, pos, b, row);
         }
@@ -74,6 +79,16 @@ void update_best(inout float bv, inout int bi, float v, uint row, uint lane16, f
             bv = val;
             bi = int(row);
         }
+    }
+}
+
+void dump_logit(F32Buf out_l, float v, float rsc, uint b, uint row, uint lane16) {
+    v += subgroupShuffleXor(v, 8u);
+    v += subgroupShuffleXor(v, 4u);
+    v += subgroupShuffleXor(v, 2u);
+    v += subgroupShuffleXor(v, 1u);
+    if (lane16 == 0u) {
+        out_l.data[b * pc.V + row] = v * rsc;
     }
 }
 
@@ -123,14 +138,13 @@ void main() {
         return;
     }
 
-    s_e2m1x2[tid] = f16vec2(E2M1_LUT[tid & 0xFu], E2M1_LUT[(tid >> 4u) & 0xFu]);
-    s_e4m3[tid] = decode_e4m3(tid);
+    s_e4m3_h[tid] = float16_t(decode_e4m3(tid) * (1.0 / 64.0));
     barrier();
 
     uint row_in_wg = tid >> 4u;
     uint lane16 = tid & 15u;
     uint start_row = gl_WorkGroupID.x * 16u + row_in_wg;
-    uint row_stride = LM_BLOCKS * 16u;
+    uint row_stride = gl_NumWorkGroups.x * 16u;
 
     float bv0 = -1e30, bv1 = -1e30, bv2 = -1e30, bv3 = -1e30;
     float bv4 = -1e30, bv5 = -1e30, bv6 = -1e30, bv7 = -1e30;
@@ -139,7 +153,7 @@ void main() {
     float inv_temp = 0.0;
     uint seed = 0u;
     uint cur_pos = 0u;
-    if (pc.sample_cfg_addr != 0ul) {
+    if (pc.stage == 0u && pc.sample_cfg_addr != 0ul) {
         F32Buf scf = F32Buf(pc.sample_cfg_addr);
         U32Buf scu = U32Buf(pc.sample_cfg_addr);
         inv_temp = scf.data[0u];
@@ -151,58 +165,76 @@ void main() {
     }
 
     F16Vec2Buf x_buf = F16Vec2Buf(pc.x_addr);
+    F32Buf s_buf = F32Buf(pc.s_addr);
+    F32Buf logits_out = F32Buf(pc.blk_val_addr);
     const uint N_BLK16 = HIDDEN >> 4u; // 144 = 9 * 16
     const uint cols_h2 = HIDDEN >> 1u; // 1152
 
     for (uint row = start_row; row < pc.V; row += row_stride) {
-        Uvec2Buf w_buf = Uvec2Buf(pc.w_addr + uint64_t(row) * uint64_t(N_BLK16) * 8ul);
-        U8Buf s_buf = U8Buf(pc.s_addr + uint64_t(row) * uint64_t(N_BLK16));
+        Uvec4Buf w_buf = Uvec4Buf(pc.w_addr + uint64_t(row) * uint64_t(HIDDEN));
+        float rsc = s_buf.data[row];
 
         float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
         float a4 = 0.0, a5 = 0.0, a6 = 0.0, a7 = 0.0;
 
         for (uint iter = 0u; iter < 9u; ++iter) {
             uint blk = lane16 + iter * 16u;
-            uvec2 w8 = w_buf.data[blk];
-            float sc = s_e4m3[uint(s_buf.data[blk])];
+            uvec4 w16 = w_buf.data[blk];
 
-            f16vec2 wh0 = s_e2m1x2[w8.x & 0xFFu];
-            f16vec2 wh1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu];
-            f16vec2 wh2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu];
-            f16vec2 wh3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu];
-            f16vec2 wh4 = s_e2m1x2[w8.y & 0xFFu];
-            f16vec2 wh5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu];
-            f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
-            f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
+            f16vec2 wh0 = f16vec2(s_e4m3_h[w16.x & 0xFFu],          s_e4m3_h[(w16.x >> 8u) & 0xFFu]);
+            f16vec2 wh1 = f16vec2(s_e4m3_h[(w16.x >> 16u) & 0xFFu], s_e4m3_h[(w16.x >> 24u) & 0xFFu]);
+            f16vec2 wh2 = f16vec2(s_e4m3_h[w16.y & 0xFFu],          s_e4m3_h[(w16.y >> 8u) & 0xFFu]);
+            f16vec2 wh3 = f16vec2(s_e4m3_h[(w16.y >> 16u) & 0xFFu], s_e4m3_h[(w16.y >> 24u) & 0xFFu]);
+            f16vec2 wh4 = f16vec2(s_e4m3_h[w16.z & 0xFFu],          s_e4m3_h[(w16.z >> 8u) & 0xFFu]);
+            f16vec2 wh5 = f16vec2(s_e4m3_h[(w16.z >> 16u) & 0xFFu], s_e4m3_h[(w16.z >> 24u) & 0xFFu]);
+            f16vec2 wh6 = f16vec2(s_e4m3_h[w16.w & 0xFFu],          s_e4m3_h[(w16.w >> 8u) & 0xFFu]);
+            f16vec2 wh7 = f16vec2(s_e4m3_h[(w16.w >> 16u) & 0xFFu], s_e4m3_h[(w16.w >> 24u) & 0xFFu]);
 
             uint xb = blk * 8u;
-            a0 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, xb), sc, a0);
-            if (SPEC_B >= 2u) a1 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, cols_h2 + xb), sc, a1);
+            a0 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, xb);
+            if (SPEC_B >= 2u) a1 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, cols_h2 + xb);
             if (SPEC_B >= 4u) {
-                a2 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 2u * cols_h2 + xb), sc, a2);
-                a3 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 3u * cols_h2 + xb), sc, a3);
+                a2 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 2u * cols_h2 + xb);
+                a3 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 3u * cols_h2 + xb);
             }
             if (SPEC_B >= 8u) {
-                a4 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 4u * cols_h2 + xb), sc, a4);
-                a5 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 5u * cols_h2 + xb), sc, a5);
-                a6 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 6u * cols_h2 + xb), sc, a6);
-                a7 = fma(dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 7u * cols_h2 + xb), sc, a7);
+                a4 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 4u * cols_h2 + xb);
+                a5 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 5u * cols_h2 + xb);
+                a6 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 6u * cols_h2 + xb);
+                a7 += dot16(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 7u * cols_h2 + xb);
             }
         }
 
-        update_best(bv0, bi0, a0, row, lane16, inv_temp, seed, cur_pos, 0u);
-        if (SPEC_B >= 2u) update_best(bv1, bi1, a1, row, lane16, inv_temp, seed, cur_pos, 1u);
-        if (SPEC_B >= 4u) {
-            update_best(bv2, bi2, a2, row, lane16, inv_temp, seed, cur_pos, 2u);
-            update_best(bv3, bi3, a3, row, lane16, inv_temp, seed, cur_pos, 3u);
-        }
-        if (SPEC_B >= 8u) {
-            update_best(bv4, bi4, a4, row, lane16, inv_temp, seed, cur_pos, 4u);
-            update_best(bv5, bi5, a5, row, lane16, inv_temp, seed, cur_pos, 5u);
-            update_best(bv6, bi6, a6, row, lane16, inv_temp, seed, cur_pos, 6u);
-            update_best(bv7, bi7, a7, row, lane16, inv_temp, seed, cur_pos, 7u);
+        if (pc.stage == 2u) {
+            dump_logit(logits_out, a0, rsc, 0u, row, lane16);
+            if (SPEC_B >= 2u) dump_logit(logits_out, a1, rsc, 1u, row, lane16);
+            if (SPEC_B >= 4u) {
+                dump_logit(logits_out, a2, rsc, 2u, row, lane16);
+                dump_logit(logits_out, a3, rsc, 3u, row, lane16);
+            }
+            if (SPEC_B >= 8u) {
+                dump_logit(logits_out, a4, rsc, 4u, row, lane16);
+                dump_logit(logits_out, a5, rsc, 5u, row, lane16);
+                dump_logit(logits_out, a6, rsc, 6u, row, lane16);
+                dump_logit(logits_out, a7, rsc, 7u, row, lane16);
+            }
+        } else {
+            update_best(bv0, bi0, a0, rsc, row, lane16, inv_temp, seed, cur_pos, 0u);
+            if (SPEC_B >= 2u) update_best(bv1, bi1, a1, rsc, row, lane16, inv_temp, seed, cur_pos, 1u);
+            if (SPEC_B >= 4u) {
+                update_best(bv2, bi2, a2, rsc, row, lane16, inv_temp, seed, cur_pos, 2u);
+                update_best(bv3, bi3, a3, rsc, row, lane16, inv_temp, seed, cur_pos, 3u);
+            }
+            if (SPEC_B >= 8u) {
+                update_best(bv4, bi4, a4, rsc, row, lane16, inv_temp, seed, cur_pos, 4u);
+                update_best(bv5, bi5, a5, rsc, row, lane16, inv_temp, seed, cur_pos, 5u);
+                update_best(bv6, bi6, a6, rsc, row, lane16, inv_temp, seed, cur_pos, 6u);
+                update_best(bv7, bi7, a7, rsc, row, lane16, inv_temp, seed, cur_pos, 7u);
+            }
         }
     }
+
+    if (pc.stage == 2u) return;
 
     if (lane16 == 0u) {
         s_mv[0][row_in_wg] = bv0; s_mi[0][row_in_wg] = bi0;

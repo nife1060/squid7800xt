@@ -277,13 +277,13 @@ pub const ModelWeights = struct {
         var pk = PackContext.init(ctx, 900 * 1024 * 1024);
         defer pk.deinit();
 
-        // 1. Pack Unembed (LM Head, 879 MiB) FIRST while host budget is completely empty, then shrink stage to 704 MiB!
+        // 1. Pack Unembed (LM Head, 879 MiB BF16 -> 440 MiB per-row FP8 E4M3) FIRST while host budget is empty, then shrink stage to 704 MiB!
         {
             const ui = sf_main.lookup("model.llm.unembed.weight");
             const usable_bytes: usize = @as(usize, constants.vocab_unpadded_count) * constants.hidden_dim * 2;
             tiger.assert(ui.byte_length >= usable_bytes);
             @memcpy(pk.stage.mapped.?[0..usable_bytes], sf_main.data_slice(ui)[0..usable_bytes]);
-            self.unembed = self.pack_bf16_to_nvfp4(&pk, pk.stage.address, constants.vocab_unpadded_count, constants.hidden_dim);
+            self.unembed = self.pack_bf16_to_fp8(&pk, pk.stage.address, constants.vocab_unpadded_count, constants.hidden_dim);
         }
         pk.resize_stage(704 * 1024 * 1024);
 
@@ -477,6 +477,44 @@ pub const ModelWeights = struct {
         var nbuf: [128]u8 = undefined;
         const tname = std.fmt.bufPrint(&nbuf, "model.llm.layers.{d}.{s}", .{ layer_idx, suffix }) catch unreachable;
         return self.upload_tensor(sf, tname, expected_bytes, stage);
+    }
+
+    fn pack_bf16_to_fp8(self: *ModelWeights, pk: *PackContext, src_addr: u64, rows: u32, cols: u32) LinearWeight {
+        tiger.assert(rows > 0 and cols > 0 and cols % 16 == 0);
+        const w_bytes: u64 = @as(u64, rows) * cols;
+        const s_bytes: u64 = @as(u64, rows) * 4;
+        const dst_w = self.arena.alloc_addr(w_bytes);
+        const dst_s = self.arena.alloc_addr(s_bytes);
+
+        const ctx = pk.ctx;
+        const cmd = ctx.imm_cmd;
+        const bi: vk.VkCommandBufferBeginInfo = .{ .flags = vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        tiger.assert_vk(ctx.vkResetCommandBuffer(cmd, 0));
+        tiger.assert_vk(ctx.vkBeginCommandBuffer(cmd, &bi));
+        ctx.vkCmdBindPipeline(cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE, pk.pipe_bf16);
+
+        const pc: PackBf16PC = .{
+            .src_addr = src_addr,
+            .dst_w_addr = dst_w,
+            .dst_s_addr = dst_s,
+            .amax_addr = 0,
+            .total_elems = cols,
+            .mode = 2,
+        };
+        ctx.vkCmdPushConstants(cmd, pk.layout_bf16, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, @sizeOf(PackBf16PC), &pc);
+        ctx.vkCmdDispatch(cmd, rows, 1, 1);
+
+        tiger.assert_vk(ctx.vkEndCommandBuffer(cmd));
+        ctx.submit_and_wait(cmd);
+
+        return .{
+            .kind = .fp8,
+            .rows = rows,
+            .cols = cols,
+            .data = dst_w,
+            .scales = dst_s,
+            .global_scale = 1.0,
+        };
     }
 
     fn pack_bf16_to_nvfp4(self: *ModelWeights, pk: *PackContext, src_addr: u64, rows: u32, cols: u32) LinearWeight {
@@ -756,7 +794,7 @@ pub const ModelWeights = struct {
             } else {
                 self.dspark.draft_vocab_ids = 0;
                 @memcpy(pk.stage.mapped.?[0..dv_bytes], h_unembed[0..dv_bytes]);
-                self.dspark.unembed_draft = self.unembed;
+                self.dspark.unembed_draft = if (self.unembed.kind == .nvfp4) self.unembed else self.pack_bf16_to_nvfp4(pk, pk.stage.address, dv, constants.hidden_dim);
             }
 
             self.dspark.fold_b = self.arena.alloc_addr(@as(u64, dv) * 4);

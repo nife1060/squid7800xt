@@ -35,16 +35,24 @@ void store_kv_128(float val, uint slot, uint h, uint tid, uint64_t cache_a, uint
         U16Buf dst = U16Buf(cache_a + (uint64_t(slot) * uint64_t(KV_DIM) + uint64_t(h * HEAD_DIM)) * 2ul);
         dst.data[tid] = f32_to_bf16(val);
     } else {
-        // Q4: signed INT4 [-7..7] + 7 stored 2 per byte; group-64 FP16 scale!
-        // With Wave64, subgroup 0 IS dims 0..63 and subgroup 1 IS dims 64..127 -> ZERO barrier needed!
-        uint g = tid >> 6u; // 0 or 1
-        float gmax = subgroupMax(abs(val));
-        float sc = max(gmax / 7.0, 1e-8);
-        if ((tid & 63u) == 0u) {
-            F16Buf sc_buf = F16Buf(q4_scale_addr(scale_a, pc.kv_cap, slot, h) + uint64_t(g * 2u));
-            sc_buf.data[0] = float16_t(sc);
+        // Asymmetric Q4_1: uint4 [0..15] stored 2 per byte; group-32 FP16 (lo, scale) pairs!
+        // Each 32-dim group lives inside half a Wave64 -> 5 shuffleXor ops, ZERO barriers!
+        uint g = tid >> 5u; // 0..3
+        float lo = val;
+        float hi = val;
+        lo = min(lo, subgroupShuffleXor(lo, 16u)); hi = max(hi, subgroupShuffleXor(hi, 16u));
+        lo = min(lo, subgroupShuffleXor(lo, 8u));  hi = max(hi, subgroupShuffleXor(hi, 8u));
+        lo = min(lo, subgroupShuffleXor(lo, 4u));  hi = max(hi, subgroupShuffleXor(hi, 4u));
+        lo = min(lo, subgroupShuffleXor(lo, 2u));  hi = max(hi, subgroupShuffleXor(hi, 2u));
+        lo = min(lo, subgroupShuffleXor(lo, 1u));  hi = max(hi, subgroupShuffleXor(hi, 1u));
+        float sc = max((hi - lo) * (1.0 / 15.0), 1e-8);
+        uint packed_ls = packHalf2x16(vec2(lo, sc));
+        if ((tid & 31u) == 0u) {
+            U32Buf(q4_scale_addr(scale_a, pc.kv_cap, slot, h) + uint64_t(g * 4u)).data[0] = packed_ls;
         }
-        int q = clamp(int(round(val / sc)), -7, 7) + 7; // 0..14
+        vec2 ls = unpackHalf2x16(packed_ls);
+        float inv_sc = (ls.y > 1e-8) ? (1.0 / ls.y) : 0.0;
+        int q = clamp(int(round((val - ls.x) * inv_sc)), 0, 15);
         int q_odd = subgroupShuffleXor(q, 1u);
         if ((tid & 1u) == 0u) {
             U8Buf dst = U8Buf(q4_data_addr(cache_a, pc.kv_cap, slot, h) + uint64_t(tid >> 1u));

@@ -50,6 +50,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 shared vec4 s_q[ROWS * (HEAD_DIM / 4u)];
+shared float s_qsum[ROWS * 4u];          // per-row, per-32-dim-slice sum(Q) for asymmetric Q4_1 K
 shared float s_rq[ROWS * D_REL];
 shared uint s_v[ATTN_TILE * (HEAD_DIM / 2u)]; // [tok][64 x f16vec2]
 shared float s_p[ROWS * ATTN_TILE];      // scores, then probabilities (in place)
@@ -77,18 +78,18 @@ RawKV load_raw(int t, bool valid, uint kvh, uint j) {
     } else {
         r.k0 = Uvec4Buf(q4_data_addr(pc.k_cache_addr, pc.cap, slot, kvh) + uint64_t(j * 16u)).data[0];
         r.v0 = Uvec4Buf(q4_data_addr(pc.v_cache_addr, pc.cap, slot, kvh) + uint64_t(j * 16u)).data[0];
-        r.ks = U32Buf(q4_scale_addr(pc.k_scale_addr, pc.cap, slot, kvh)).data[0];
-        r.vs = U32Buf(q4_scale_addr(pc.v_scale_addr, pc.cap, slot, kvh)).data[0];
+        r.ks = U32Buf(q4_scale_addr(pc.k_scale_addr, pc.cap, slot, kvh) + uint64_t(j * 4u)).data[0];
+        r.vs = U32Buf(q4_scale_addr(pc.v_scale_addr, pc.cap, slot, kvh) + uint64_t(j * 4u)).data[0];
     }
     return r;
 }
 
-// 8 dims (c-th chunk of this lane's 32-dim slice) as float, scale NOT applied for Q4.
+// 8 dims (c-th chunk of this lane's 32-dim slice) as float [0..15], scale/lo NOT applied for Q4_1.
 void unpack_q4_word(uint w, out vec4 a, out vec4 b) {
-    a = vec4(float(int(w & 0xFu)), float(int((w >> 4u) & 0xFu)),
-             float(int((w >> 8u) & 0xFu)), float(int((w >> 12u) & 0xFu))) - 7.0;
-    b = vec4(float(int((w >> 16u) & 0xFu)), float(int((w >> 20u) & 0xFu)),
-             float(int((w >> 24u) & 0xFu)), float(int((w >> 28u) & 0xFu))) - 7.0;
+    a = vec4(float(w & 0xFu), float((w >> 4u) & 0xFu),
+             float((w >> 8u) & 0xFu), float((w >> 12u) & 0xFu));
+    b = vec4(float((w >> 16u) & 0xFu), float((w >> 20u) & 0xFu),
+             float((w >> 24u) & 0xFu), float((w >> 28u) & 0xFu));
 }
 void unpack_bf16_vec(uvec4 u, out vec4 a, out vec4 b) {
     a = vec4(uintBitsToFloat(u.x << 16u), uintBitsToFloat(u.x & 0xFFFF0000u),
@@ -139,6 +140,17 @@ void main() {
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
+    if (pc.kv_fmt != 0u) {
+        for (uint i = lane; i < ROWS * 4u; i += 64u) {
+            uint qb = i * 8u;
+            vec4 sum4 = s_q[qb + 0u] + s_q[qb + 1u] + s_q[qb + 2u] + s_q[qb + 3u]
+                      + s_q[qb + 4u] + s_q[qb + 5u] + s_q[qb + 6u] + s_q[qb + 7u];
+            s_qsum[i] = (sum4.x + sum4.y) + (sum4.z + sum4.w);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+
     // Row-owner softmax state: lane r (< ROWS) owns (m, l) of row r. No cross-lane reductions
     // per row: scores go through LDS and each owner lane scans its 16 tokens serially.
     float m_own = -1e30;
@@ -158,13 +170,13 @@ void main() {
         RawKV nxt = load_raw(tn, tn < t_end, kvh, j); // prefetch next tile
 
         // ---- Decode this lane's 32 K dims ----
-        float ksc = 1.0;
-        float vsc = 1.0;
+        float klo = 0.0, ksc = 1.0;
+        float vlo = 0.0, vsc = 1.0;
         if (pc.kv_fmt != 0u) {
-            vec2 kss = unpackHalf2x16(cur.ks);
-            vec2 vss = unpackHalf2x16(cur.vs);
-            ksc = (j < 2u) ? kss.x : kss.y;
-            vsc = (j < 2u) ? vss.x : vss.y;
+            vec2 kls = unpackHalf2x16(cur.ks);
+            vec2 vls = unpackHalf2x16(cur.vs);
+            klo = kls.x; ksc = kls.y;
+            vlo = vls.x; vsc = vls.y;
         }
         vec4 kf[8];
         if (pc.kv_fmt == 0u) {
@@ -179,6 +191,7 @@ void main() {
             unpack_q4_word(cur.k0.w, kf[6], kf[7]);
         }
         float dscale = ksc * INV_SQRT_HEAD_DIM;
+        float dlo = klo * INV_SQRT_HEAD_DIM;
 
         // ---- Stage V tile (f16) for the PV pass: s_v[tok][dim/2] ----
         {
@@ -198,7 +211,8 @@ void main() {
                 [[unroll]] for (uint c = 0u; c < 4u; ++c) {
                     vec4 a, b;
                     unpack_q4_word(vw[c], a, b);
-                    a *= vsc; b *= vsc;
+                    a = fma(a, vec4(vsc), vec4(vlo));
+                    b = fma(b, vec4(vsc), vec4(vlo));
                     s_v[base + c * 4u + 0u] = packHalf2x16(a.xy);
                     s_v[base + c * 4u + 1u] = packHalf2x16(a.zw);
                     s_v[base + c * 4u + 2u] = packHalf2x16(b.xy);
@@ -231,7 +245,7 @@ void main() {
                 uint qb = r * (HEAD_DIM / 4u) + j * 8u;
                 float part = 0.0;
                 [[unroll]] for (uint c = 0u; c < 8u; ++c) part += dot(s_q[qb + c], kf[c]);
-                part *= dscale;
+                part = (pc.kv_fmt != 0u) ? fma(part, dscale, dlo * s_qsum[r * 4u + j]) : (part * dscale);
                 if (tile_bias) {
                     uint rb = r * D_REL + j * 4u;
                     part += dot(vec4(s_rq[rb], s_rq[rb + 1u], s_rq[rb + 2u], s_rq[rb + 3u]), relw);

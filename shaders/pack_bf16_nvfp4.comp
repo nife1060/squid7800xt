@@ -3,9 +3,12 @@
 #include "common.glsl"
 #include "nvfp4_scale_search.glsl"
 
-// Two-mode BF16 -> NVFP4 packer:
+// Multi-mode BF16 packer:
 // mode == 0: compute global tensor amax into dst_amax_u32 (atomicMax of floatBitsToUint(abs(v)))
 // mode == 1: quantize [N, K] BF16 -> NVFP4 (dst_w [N, K/2] + dst_s [N, K/16]) using global_scale = amax / (448 * 6)
+// mode == 2: quantize [N, K] BF16 -> per-row FP8 E4M3 (dst_w [N, K] U8 + dst_s [N] F32 pre-multiplied by 64.0
+//            so runtime LUT decode_e4m3(c)/64 stays in [-7, +7] with zero FP16 overflow risk);
+//            Grid = (N, 1, 1), total_elems = K.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -14,11 +17,12 @@ layout(push_constant) uniform PC {
     uint64_t dst_w_addr;
     uint64_t dst_s_addr;
     uint64_t amax_addr; // u32 atomic max output (mode 0) or input (mode 1)
-    uint total_elems;   // N * K (mode 0) or total_blocks16 = N * (K/16) (mode 1)
+    uint total_elems;   // N * K (mode 0), total_blocks16 (mode 1), or K (mode 2)
     uint mode;
 } pc;
 
 shared float s_max[8];
+shared float s_row_inv;
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -46,7 +50,36 @@ void main() {
         return;
     }
 
-    // mode == 1: quantize 16-element blocks
+    if (pc.mode == 2u) {
+        // Per-row BF16 -> FP8 E4M3 (1 WG per row, cols = pc.total_elems)
+        uint row = gl_WorkGroupID.x;
+        uint K = pc.total_elems;
+        U16Buf src = U16Buf(pc.src_addr + uint64_t(row) * uint64_t(K) * 2ul);
+        float lmax = 0.0;
+        for (uint k = tid; k < K; k += 256u) {
+            lmax = max(lmax, abs(bf16_to_f32(src.data[k])));
+        }
+        float sg_max = subgroupMax(lmax);
+        if (subgroupElect()) s_max[gl_SubgroupID] = sg_max;
+        barrier();
+        if (tid == 0u) {
+            float rmax = 0.0;
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) rmax = max(rmax, s_max[s]);
+            float raw_sc = max(rmax / 448.0, 1e-12);
+            // Store raw_sc * 64.0; runtime LUT scales E4M3 by 1/64 into [-7, +7] to prevent FP16 overflow.
+            F32Buf(pc.dst_s_addr).data[row] = raw_sc * 64.0;
+            s_row_inv = 1.0 / raw_sc;
+        }
+        barrier();
+        float inv_sc = s_row_inv;
+        U8Buf dst_w = U8Buf(pc.dst_w_addr + uint64_t(row) * uint64_t(K));
+        for (uint k = tid; k < K; k += 256u) {
+            dst_w.data[k] = uint8_t(encode_e4m3(bf16_to_f32(src.data[k]) * inv_sc));
+        }
+        return;
+    }
+
+    // mode == 1: quantize 16-element blocks to NVFP4
     uint bidx = gl_GlobalInvocationID.x;
     if (bidx >= pc.total_elems) return;
 

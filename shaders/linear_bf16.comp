@@ -4,9 +4,9 @@
 
 // Exact BF16-weight GEMV for small, accuracy-critical matrices (the MoE router):
 //   y[b, row] = W[row, :] . x[b, :]     W: [rows, cols] BF16, x: [B, cols] F16, y: [B, rows] F32
-// One workgroup (4 x Wave64) per output row. The row's weights stay in registers (cols <= 4096)
-// and are reused for every batch row; accumulation is F32. Serves decode (B <= 8) and the
-// B = 64 WMMA prefill. The router is 128 x 2304, so this is ~0.6 MB per call: bandwidth-trivial.
+// 4 Wave64 subgroups (256 threads) per output row -> fills all 4 RDNA 3 SIMDs/CU cleanly!
+// Fast path for cols == HIDDEN (2304 = 576 uvec2s = 2*256 + 64): at most 3 coalesced 8-byte uvec2
+// loads per thread (12 VGPRs, zero scratch spills) reused across all B rows; F32 accumulation.
 // Grid: (rows, 1, 1), Local: 256.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -20,38 +20,57 @@ layout(push_constant) uniform PC {
     uint B;     // 1..64
 } pc;
 
-const uint PER_THREAD_MAX = 16u; // 16 * 256 = 4096 columns
 const uint B_MAX = 64u;
+shared float s_part[4][B_MAX];
 
-shared float s_part[4][B_MAX]; // [subgroup][b]
+vec4 unpack_bf16x4(uvec2 u) {
+    return vec4(
+        uintBitsToFloat(u.x << 16u),
+        uintBitsToFloat(u.x & 0xFFFF0000u),
+        uintBitsToFloat(u.y << 16u),
+        uintBitsToFloat(u.y & 0xFFFF0000u)
+    );
+}
+
+vec4 unpack_f16x4(uvec2 u) {
+    return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y));
+}
 
 void main() {
     uint row = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
 
-    U16Buf w = U16Buf(pc.w_addr + uint64_t(row) * uint64_t(pc.cols) * 2ul);
-    float wr[PER_THREAD_MAX];
-    for (uint i = 0u; i < PER_THREAD_MAX; ++i) {
-        uint k = tid + i * 256u;
-        wr[i] = (k < pc.cols) ? bf16_to_f32(w.data[k]) : 0.0;
-    }
+    if (pc.cols == HIDDEN) {
+        Uvec2Buf w = Uvec2Buf(pc.w_addr + uint64_t(row) * uint64_t(HIDDEN) * 2ul);
+        vec4 w0 = unpack_bf16x4(w.data[tid]);
+        vec4 w1 = unpack_bf16x4(w.data[tid + 256u]);
+        vec4 w2 = (tid < 64u) ? unpack_bf16x4(w.data[tid + 512u]) : vec4(0.0);
 
-    F16Buf x = F16Buf(pc.x_h_addr);
-    for (uint b = 0u; b < pc.B; ++b) {
-        uint xo = b * pc.cols;
-        float acc = 0.0;
-        for (uint i = 0u; i < PER_THREAD_MAX; ++i) {
-            uint k = tid + i * 256u;
-            if (k < pc.cols) acc = fma(wr[i], float(x.data[xo + k]), acc);
+        for (uint b = 0u; b < pc.B; ++b) {
+            Uvec2Buf x = Uvec2Buf(pc.x_h_addr + uint64_t(b * HIDDEN) * 2ul);
+            float acc = dot(w0, unpack_f16x4(x.data[tid]))
+                      + dot(w1, unpack_f16x4(x.data[tid + 256u]));
+            if (tid < 64u) acc += dot(w2, unpack_f16x4(x.data[tid + 512u]));
+            acc = subgroupAdd(acc);
+            if (subgroupElect()) s_part[gl_SubgroupID][b] = acc;
         }
-        acc = subgroupAdd(acc);
-        if (subgroupElect()) s_part[gl_SubgroupID][b] = acc;
+    } else {
+        U16Buf w = U16Buf(pc.w_addr + uint64_t(row) * uint64_t(pc.cols) * 2ul);
+        F16Buf x = F16Buf(pc.x_h_addr);
+        for (uint b = 0u; b < pc.B; ++b) {
+            uint xo = b * pc.cols;
+            float acc = 0.0;
+            for (uint k = tid; k < pc.cols; k += 256u) {
+                acc = fma(bf16_to_f32(w.data[k]), float(x.data[xo + k]), acc);
+            }
+            acc = subgroupAdd(acc);
+            if (subgroupElect()) s_part[gl_SubgroupID][b] = acc;
+        }
     }
     barrier();
 
     if (tid < pc.B) {
-        float s = 0.0;
-        for (uint sg = 0u; sg < gl_NumSubgroups; ++sg) s += s_part[sg][tid];
-        F32Buf(pc.y_addr).data[tid * pc.rows + row] = s;
+        F32Buf(pc.y_addr).data[tid * pc.rows + row] =
+            (s_part[0][tid] + s_part[1][tid]) + (s_part[2][tid] + s_part[3][tid]);
     }
 }

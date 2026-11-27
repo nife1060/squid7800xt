@@ -61,9 +61,10 @@ pub const attn_tile_tokens: u32 = 16;
 pub const attn_min_tiles: u32 = 4;
 pub const attn_split_max: u32 = 128; // B = 8 rows (verify / prefill sub-chunks / DSpark)
 pub const attn_split_max_small_b: u32 = 256; // cap for B <= 4
-pub const kv_q4_group_size: u32 = 64;
-pub const kv_q4_groups_per_head: u32 = head_dim / kv_q4_group_size; // 2
-pub const kv_q4_scales_per_token: u32 = kv_head_count * kv_q4_groups_per_head; // 16
+pub const kv_q4_group_size: u32 = 32;
+pub const kv_q4_groups_per_head: u32 = head_dim / kv_q4_group_size; // 4
+// Asymmetric Q4_1: each 32-dim group stores (lo, scale) as 2 x f16 = 4 B -> 16 B/head = 64 f16s/tok.
+pub const kv_q4_scales_per_token: u32 = kv_head_count * kv_q4_groups_per_head * 2; // 64 f16s (128 B)
 // m + d + o[128] per (head, row<=8, split<=128)
 pub const split_buffer_floats: u64 = @as(u64, head_count) * mtp_block_size_max * attn_split_max * (2 + head_dim);
 pub const dspark_workspace_floats: u64 = 2_000_000;

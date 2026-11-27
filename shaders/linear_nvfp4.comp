@@ -2,9 +2,11 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-// High-bandwidth Persistent Wave64 LDS-LUT256 NVFP4 Linear GEMV / Small-Batch (B = 1..8).
-// Uses Vulkan Specialization Constant SPEC_B (1, 2, 3, 4, 7, 8) + 16-byte uvec4 X loads!
-// Grid: (min((rows + 15) / 16, 240), 1, 1), Local: 256 threads (Wave64).
+// High-bandwidth Wave64 LDS-LUT256 NVFP4 Linear GEMV / Small-Batch (B = 1..8).
+// Uses Vulkan Specialization Constant SPEC_B (1, 2, 3, 4, 7, 8) + scalar accumulators.
+// For SPEC_B >= 2, cooperatively stages each 16-block (256-elem) chunk of X into padded LDS
+// s_x[SPEC_B][16][9] (zero bank conflicts, 16x fewer global X loads across the 16 WG rows!).
+// Grid: ((rows + 15) / 16, 1, 1), Local: 256 threads (Wave64).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint SPEC_B = 1u;
@@ -23,6 +25,7 @@ layout(push_constant) uniform PC {
 
 shared f16vec2 s_e2m1x2[256];
 shared float s_e4m3[256];
+shared f16vec2 s_x[SPEC_B][16][9]; // [b][lane16][0..7] (+1 pad -> zero LDS bank conflicts!)
 
 float dot16_h2(
     f16vec2 wh0, f16vec2 wh1, f16vec2 wh2, f16vec2 wh3,
@@ -37,6 +40,23 @@ float dot16_h2(
     p1 = fma(wh5, x_buf.data[xo + 5u], p1);
     p0 = fma(wh6, x_buf.data[xo + 6u], p0);
     p1 = fma(wh7, x_buf.data[xo + 7u], p1);
+    f16vec2 s2 = p0 + p1;
+    return float(s2.x) + float(s2.y);
+}
+
+float dot16_lds(
+    f16vec2 wh0, f16vec2 wh1, f16vec2 wh2, f16vec2 wh3,
+    f16vec2 wh4, f16vec2 wh5, f16vec2 wh6, f16vec2 wh7,
+    uint b, uint lane16
+) {
+    f16vec2 p0 = wh0 * s_x[b][lane16][0u];
+    f16vec2 p1 = wh1 * s_x[b][lane16][1u];
+    p0 = fma(wh2, s_x[b][lane16][2u], p0);
+    p1 = fma(wh3, s_x[b][lane16][3u], p1);
+    p0 = fma(wh4, s_x[b][lane16][4u], p0);
+    p1 = fma(wh5, s_x[b][lane16][5u], p1);
+    p0 = fma(wh6, s_x[b][lane16][6u], p0);
+    p1 = fma(wh7, s_x[b][lane16][7u], p1);
     f16vec2 s2 = p0 + p1;
     return float(s2.x) + float(s2.y);
 }
@@ -63,20 +83,21 @@ void main() {
     uint row_in_wg = tid >> 4u;
     uint lane16 = tid & 15u;
     uint row = gl_WorkGroupID.x * 16u + row_in_wg;
-    if (row >= pc.rows) return;
+    bool row_valid = (row < pc.rows);
 
     uint n_blocks16 = pc.cols >> 4u;
     uint cols_h2 = pc.cols >> 1u;
     F16Vec2Buf x_buf = F16Vec2Buf(pc.x_h_addr);
     F32Buf y_buf = F32Buf(pc.y_addr);
 
-    {
-        Uvec2Buf w_buf = Uvec2Buf(pc.w_addr + uint64_t(row) * uint64_t(n_blocks16) * 8ul);
-        U8Buf s_buf = U8Buf(pc.s_addr + uint64_t(row) * uint64_t(n_blocks16));
+    Uvec2Buf w_buf = Uvec2Buf(pc.w_addr + uint64_t(row) * uint64_t(n_blocks16) * 8ul);
+    U8Buf s_buf = U8Buf(pc.s_addr + uint64_t(row) * uint64_t(n_blocks16));
 
-        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-        float a4 = 0.0, a5 = 0.0, a6 = 0.0, a7 = 0.0;
+    float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+    float a4 = 0.0, a5 = 0.0, a6 = 0.0, a7 = 0.0;
 
+    if (SPEC_B == 1u) {
+        if (!row_valid) return;
         for (uint blk = lane16; blk < n_blocks16; blk += 16u) {
             uvec2 w8 = w_buf.data[blk];
             float sc = s_e4m3[uint(s_buf.data[blk])];
@@ -90,24 +111,57 @@ void main() {
             f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
             f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
 
-            uint xb = blk * 8u;
-            a0 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, xb), sc, a0);
-            if (SPEC_B >= 2u) a1 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, cols_h2 + xb), sc, a1);
-            if (SPEC_B >= 3u) a2 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 2u * cols_h2 + xb), sc, a2);
-            if (SPEC_B >= 4u) a3 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 3u * cols_h2 + xb), sc, a3);
-            if (SPEC_B >= 5u) a4 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 4u * cols_h2 + xb), sc, a4);
-            if (SPEC_B >= 6u) a5 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 5u * cols_h2 + xb), sc, a5);
-            if (SPEC_B >= 7u) a6 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 6u * cols_h2 + xb), sc, a6);
-            if (SPEC_B >= 8u) a7 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, 7u * cols_h2 + xb), sc, a7);
+            a0 = fma(dot16_h2(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, x_buf, blk * 8u), sc, a0);
         }
-
         store_out(y_buf, 0u, row, lane16, a0);
-        if (SPEC_B >= 2u) store_out(y_buf, 1u, row, lane16, a1);
-        if (SPEC_B >= 3u) store_out(y_buf, 2u, row, lane16, a2);
-        if (SPEC_B >= 4u) store_out(y_buf, 3u, row, lane16, a3);
-        if (SPEC_B >= 5u) store_out(y_buf, 4u, row, lane16, a4);
-        if (SPEC_B >= 6u) store_out(y_buf, 5u, row, lane16, a5);
-        if (SPEC_B >= 7u) store_out(y_buf, 6u, row, lane16, a6);
-        if (SPEC_B >= 8u) store_out(y_buf, 7u, row, lane16, a7);
+        return;
     }
+
+    // SPEC_B >= 2: cooperatively stage 16 blocks (128 f16vec2s) of X per batch row into LDS!
+    const uint total_x = SPEC_B * 128u;
+    for (uint blk0 = 0u; blk0 < n_blocks16; blk0 += 16u) {
+        for (uint i = tid; i < total_x; i += 256u) {
+            uint b = i >> 7u;
+            uint l = (i >> 3u) & 15u;
+            uint k = i & 7u;
+            uint gblk = blk0 + l;
+            s_x[b][l][k] = (gblk < n_blocks16) ? x_buf.data[b * cols_h2 + gblk * 8u + k] : f16vec2(0.0);
+        }
+        barrier();
+
+        uint blk = blk0 + lane16;
+        if (row_valid && blk < n_blocks16) {
+            uvec2 w8 = w_buf.data[blk];
+            float sc = s_e4m3[uint(s_buf.data[blk])];
+
+            f16vec2 wh0 = s_e2m1x2[w8.x & 0xFFu];
+            f16vec2 wh1 = s_e2m1x2[(w8.x >> 8u) & 0xFFu];
+            f16vec2 wh2 = s_e2m1x2[(w8.x >> 16u) & 0xFFu];
+            f16vec2 wh3 = s_e2m1x2[(w8.x >> 24u) & 0xFFu];
+            f16vec2 wh4 = s_e2m1x2[w8.y & 0xFFu];
+            f16vec2 wh5 = s_e2m1x2[(w8.y >> 8u) & 0xFFu];
+            f16vec2 wh6 = s_e2m1x2[(w8.y >> 16u) & 0xFFu];
+            f16vec2 wh7 = s_e2m1x2[(w8.y >> 24u) & 0xFFu];
+
+            a0 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 0u, lane16), sc, a0);
+            if (SPEC_B >= 2u) a1 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 1u, lane16), sc, a1);
+            if (SPEC_B >= 3u) a2 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 2u, lane16), sc, a2);
+            if (SPEC_B >= 4u) a3 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 3u, lane16), sc, a3);
+            if (SPEC_B >= 5u) a4 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 4u, lane16), sc, a4);
+            if (SPEC_B >= 6u) a5 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 5u, lane16), sc, a5);
+            if (SPEC_B >= 7u) a6 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 6u, lane16), sc, a6);
+            if (SPEC_B >= 8u) a7 = fma(dot16_lds(wh0, wh1, wh2, wh3, wh4, wh5, wh6, wh7, 7u, lane16), sc, a7);
+        }
+        barrier();
+    }
+
+    if (!row_valid) return;
+    store_out(y_buf, 0u, row, lane16, a0);
+    if (SPEC_B >= 2u) store_out(y_buf, 1u, row, lane16, a1);
+    if (SPEC_B >= 3u) store_out(y_buf, 2u, row, lane16, a2);
+    if (SPEC_B >= 4u) store_out(y_buf, 3u, row, lane16, a3);
+    if (SPEC_B >= 5u) store_out(y_buf, 4u, row, lane16, a4);
+    if (SPEC_B >= 6u) store_out(y_buf, 5u, row, lane16, a5);
+    if (SPEC_B >= 7u) store_out(y_buf, 6u, row, lane16, a6);
+    if (SPEC_B >= 8u) store_out(y_buf, 7u, row, lane16, a7);
 }

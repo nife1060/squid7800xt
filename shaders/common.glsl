@@ -51,7 +51,7 @@ const uint MTP_MARKOV_RANK = 256u;
 const uint ATTN_TILE = 16u;
 const uint ATTN_MIN_TILES = 4u;     // >= 64 tokens per split (amortizes Q staging)
 const uint ATTN_SPLIT_MAX = 128u;   // decode / verify / DSpark split budget per KV head
-const uint KV_Q4_SCALES_PER_TOK = 16u;
+const uint KV_Q4_SCALES_PER_TOK = 64u;
 
 const float RMS_EPS = 1e-6;
 const float QK_CLIP = 22.627416997969522;
@@ -161,11 +161,11 @@ uvec2 attn_split_layout(int lo, int hi, uint n_split_max) {
     return uvec2(tps, (ntiles + tps - 1u) / tps);
 }
 
-// Q4 KV cache is HEAD-MAJOR: data [kvh][cap][64 B], scales [kvh][cap][2 x f16].
-// A split streams one contiguous run per KV head (no 512 B token stride, no 2 B scale gathers).
+// Q4_1 KV cache is HEAD-MAJOR: data [kvh][cap][64 B], scales [kvh][cap][4 x f16vec2(lo, sc) = 16 B].
+// Group-32 asymmetric Q4_1: lane j in attn_tile owns 32-dim slice j and reads 1 u32 at + j*4!
 uint64_t q4_data_addr(uint64_t base, uint cap, uint slot, uint kvh) {
     return base + (uint64_t(kvh) * uint64_t(cap) + uint64_t(slot)) * 64ul;
 }
 uint64_t q4_scale_addr(uint64_t base, uint cap, uint slot, uint kvh) {
-    return base + (uint64_t(kvh) * uint64_t(cap) + uint64_t(slot)) * 4ul;
+    return base + (uint64_t(kvh) * uint64_t(cap) + uint64_t(slot)) * 16ul;
 }

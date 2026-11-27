@@ -2030,7 +2030,22 @@ pub const Engine = struct {
             tiger.assert_vk(self.ctx.vkBeginCommandBuffer(cmd, &bi));
             self.record_target_forward(cmd, 8, false, false, false, false, null);
             self.ctx.cmd_compute_barrier(cmd);
-            self.pipes.cmd_linear(cmd, &self.weights.unembed, self.mlp_normed_h, self.score_logits_buf.address, 8, false);
+            self.pipes.dispatch(cmd, self.pipes.lm_head.pair(8), kernels.LmHeadPC{
+                .w_addr = self.weights.unembed.data,
+                .s_addr = self.weights.unembed.scales,
+                .x_addr = self.mlp_normed_h,
+                .blk_val_addr = self.score_logits_buf.address,
+                .blk_idx_addr = 0,
+                .out_tokens_addr = 0,
+                .d_pos_addr = 0,
+                .d_tokens_addr = 0,
+                .sample_cfg_addr = 0,
+                .V = constants.vocab_unpadded_count,
+                .global_scale = self.weights.unembed.global_scale,
+                .B = 8,
+                .stage = 2,
+                .advance_b1 = 0,
+            }, 512, 1, 1);
             tiger.assert_vk(self.ctx.vkEndCommandBuffer(cmd));
             self.cmd_b8_score = cmd;
         }
@@ -2535,8 +2550,8 @@ pub const Engine = struct {
         var b_rel = ctx.create_host_buffer(constants.rel_dim * constants.rel_extent * 2, true, true);
         var b_kq = ctx.create_host_buffer(@as(u64, cap_q4) * 512, true, true);
         var b_vq = ctx.create_host_buffer(@as(u64, cap_q4) * 512, true, true);
-        var b_ks = ctx.create_host_buffer(@as(u64, cap_q4) * 32, true, true);
-        var b_vs = ctx.create_host_buffer(@as(u64, cap_q4) * 32, true, true);
+        var b_ks = ctx.create_host_buffer(@as(u64, cap_q4) * constants.kv_q4_scales_per_token * 2, true, true);
+        var b_vs = ctx.create_host_buffer(@as(u64, cap_q4) * constants.kv_q4_scales_per_token * 2, true, true);
         var b_kb = ctx.create_host_buffer(@as(u64, cap_bf) * constants.kv_dim * 2, true, true);
         var b_vb = ctx.create_host_buffer(@as(u64, cap_bf) * constants.kv_dim * 2, true, true);
         var b_out = ctx.create_host_buffer(8 * constants.query_dim * 2, true, true);
@@ -2559,10 +2574,15 @@ pub const Engine = struct {
         const rel = f32s(&b_rel, u16);
         for (rel) |*x| x.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2.0 - 1.0) * 0.5)) >> 16);
         for ([_]*vk.GpuBuffer{ &b_kq, &b_vq }) |bp| {
-            for (f32s(bp, u8)) |*x| x.* = @intCast(rnd.intRangeAtMost(u8, 0, 14) | (@as(u8, rnd.intRangeAtMost(u8, 0, 14)) << 4));
+            for (f32s(bp, u8)) |*x| x.* = @intCast(rnd.intRangeAtMost(u8, 0, 15) | (@as(u8, rnd.intRangeAtMost(u8, 0, 15)) << 4));
         }
         for ([_]*vk.GpuBuffer{ &b_ks, &b_vs }) |bp| {
-            for (f32s(bp, f16)) |*x| x.* = @floatCast(0.05 + rnd.float(f32) * 0.4);
+            const sl = f32s(bp, f16);
+            var idx: usize = 0;
+            while (idx + 1 < sl.len) : (idx += 2) {
+                sl[idx] = @floatCast((rnd.float(f32) * 2.0 - 1.0) * 1.5); // lo
+                sl[idx + 1] = @floatCast(0.02 + rnd.float(f32) * 0.25); // sc
+            }
         }
         for ([_]*vk.GpuBuffer{ &b_kb, &b_vb }) |bp| {
             for (f32s(bp, u16)) |*x| x.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2.0 - 1.0) * 2.0)) >> 16);
@@ -2677,8 +2697,11 @@ pub const Engine = struct {
                         for (0..constants.head_dim) |d| {
                             const kval: f64 = if (is_q4) blk: {
                                 const byte = kq8[(kvh * cap + slot) * 64 + d / 2];
-                                const nib: i32 = if (d & 1 == 0) byte & 0xF else byte >> 4;
-                                break :blk @as(f64, @floatFromInt(nib - 7)) * @as(f64, ks16[(kvh * cap + slot) * 2 + d / 64]);
+                                const nib: u32 = if (d & 1 == 0) byte & 0xF else byte >> 4;
+                                const g = d / 32;
+                                const lo: f64 = ks16[(kvh * cap + slot) * 8 + g * 2];
+                                const sc: f64 = ks16[(kvh * cap + slot) * 8 + g * 2 + 1];
+                                break :blk lo + @as(f64, @floatFromInt(nib)) * sc;
                             } else @as(f64, @as(f32, @bitCast(@as(u32, kb16[slot * constants.kv_dim + kvh * constants.head_dim + d]) << 16)));
                             dot += kval * qh[d];
                         }
@@ -2700,8 +2723,11 @@ pub const Engine = struct {
                         for (0..constants.head_dim) |d| {
                             const vval: f64 = if (is_q4) blk: {
                                 const byte = vq8[(kvh * cap + slot) * 64 + d / 2];
-                                const nib: i32 = if (d & 1 == 0) byte & 0xF else byte >> 4;
-                                break :blk @as(f64, @floatFromInt(nib - 7)) * @as(f64, vs16[(kvh * cap + slot) * 2 + d / 64]);
+                                const nib: u32 = if (d & 1 == 0) byte & 0xF else byte >> 4;
+                                const g = d / 32;
+                                const lo: f64 = vs16[(kvh * cap + slot) * 8 + g * 2];
+                                const sc: f64 = vs16[(kvh * cap + slot) * 8 + g * 2 + 1];
+                                break :blk lo + @as(f64, @floatFromInt(nib)) * sc;
                             } else @as(f64, @as(f32, @bitCast(@as(u32, vb16[slot * constants.kv_dim + kvh * constants.head_dim + d]) << 16)));
                             acc[d] += pw * vval;
                         }
@@ -2760,8 +2786,8 @@ pub const Engine = struct {
             constants.hidden_dim * (constants.intermediate_dim / 2 + constants.intermediate_dim / 16);
         const per_expert_all_layers: u64 = per_expert_layer * constants.layer_count;
         const experts_total: u64 = per_expert_all_layers * constants.expert_count;
-        // Dense attention/router/controllers/norms/LM head (+ DSpark) measured at ~0.61 / ~0.82 GiB.
-        const non_expert: u64 = if (has_mtp) 880 * 1024 * 1024 else 655 * 1024 * 1024;
+        // Dense attention/router(BF16)/controllers/norms/FP8 LM head (+ DSpark) measured at ~0.82 / ~1.03 GiB.
+        const non_expert: u64 = if (has_mtp) 1090 * 1024 * 1024 else 865 * 1024 * 1024;
         const margin: u64 = 96 * 1024 * 1024; // desktop VRAM jitter + arena slab rounding (overflow degrades gracefully to DDR5)
         const need: u64 = non_expert + experts_total + runtime_vram_estimate(ctx_tokens, has_mtp) + margin;
         const gib = 1024.0 * 1024.0 * 1024.0;

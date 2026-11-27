@@ -176,6 +176,7 @@ pub fn main() void {
         var model_name: []const u8 = "inkling-2-mini";
         var no_prefix_cache: bool = false;
         var expert_tier: ?u32 = null; // null = auto (size from VRAM budget and --ctx)
+        var kv_format: constants.KVFormat = .q4;
         var score_tokens_path: []const u8 = "";
         var score_out_path: []const u8 = "";
         var score_window: u32 = 1024;
@@ -226,6 +227,9 @@ pub fn main() void {
             } else if (std.mem.eql(u8, flag, "--expert-tier") and ai + 1 < args.count) {
                 ai += 1;
                 expert_tier = if (std.mem.eql(u8, args.slices[ai], "auto")) null else (std.fmt.parseInt(u32, args.slices[ai], 10) catch null);
+            } else if (std.mem.eql(u8, flag, "--kv") and ai + 1 < args.count) {
+                ai += 1;
+                kv_format = if (std.mem.eql(u8, args.slices[ai], "bf16")) .bf16 else .q4;
             } else if (std.mem.eql(u8, flag, "--tokens") and ai + 1 < args.count) {
                 ai += 1;
                 score_tokens_path = args.slices[ai];
@@ -271,7 +275,7 @@ pub fn main() void {
         defer w.deinit();
 
         var eng: engine_mod.Engine = .{};
-        eng.init(&ctx, &w, ctx_len, .q4);
+        eng.init(&ctx, &w, ctx_len, kv_format);
         eng.spec_threshold = spec_threshold;
         eng.debug_mtp = debug_mtp;
         eng.sample_params = .{ .temperature = temperature, .seed = seed };
